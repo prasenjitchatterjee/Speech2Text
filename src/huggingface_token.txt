@@ -1,5 +1,5 @@
 def get_hfaccess_token():
-    file_path = r"C:\Users\pcmob\Documents\Codes\Python\huggingface_access_token.txt"
+    file_path = r"C:\Users\XYZ\Documents\Codes\Python\huggingface_access_token.txt"
     try:
         with open(file_path, 'r') as file:
             content = file.read()
