@@ -1,0 +1,31 @@
+import datetime
+import logging
+
+
+logger = logging.getLogger('Speech2Text')
+logger.setLevel(logging.INFO)
+# create file handler which logs even debug messages
+fh = logging.FileHandler('output.log', mode="w")
+fh.setLevel(logging.INFO)
+logger.addHandler(fh)
+
+
+def show_current_time():
+    now = datetime.datetime.now()
+    current_time = now.strftime("%H:%M:%S")
+    return f"[{current_time}]: "
+
+def show_current_timestamp():
+    now = datetime.datetime.now()
+    timestamp_string = now.strftime("%Y-%m-%d %H:%M:%S")
+    return f"[{timestamp_string}]: "
+
+def console_log(text, is_timeonly=True):
+    if is_timeonly == True:
+        print(show_current_time(), text)
+    else :
+        print(show_current_timestamp(), text)
+    
+
+def log_message(text):
+    logger.info(show_current_timestamp() + ": " + text)

@@ -1,0 +1,7 @@
+{
+    "config_files": {
+        "audio_config": "audio_config_default.json",
+        "network_config": "network_config_default.json"
+    }
+
+}

@@ -1,0 +1,26 @@
+import os
+from pydub import AudioSegment
+
+
+def load_audio(filename):
+    return filename
+
+
+def split_diarized_audio(audio_file, diarization_result):
+    # Load audio file
+    audio = AudioSegment.from_wav(audio_file)
+
+    # Directory to store speaker segments
+    output_dir = r"speaker_segments"
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Process diarized segments
+    for i, (segment, _, speaker) in enumerate(diarization_result.itertracks(yield_label=True)):
+        print("segment: ", segment)
+        start_time = int(segment.start * 1000)  # Convert to milliseconds
+        end_time = int(segment.end * 1000)
+
+        # Extract segment
+        segment_audio = audio[start_time:end_time]
+        segment_filename = os.path.join(output_dir, f"{speaker}_{i}.wav")
+        segment_audio.export(segment_filename, format="wav")

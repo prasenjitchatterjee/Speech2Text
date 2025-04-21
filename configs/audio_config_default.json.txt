@@ -1,0 +1,13 @@
+{
+    "audio_config": {
+      "bit_depth": 16,
+      "sample_rate": 16000,
+      "channels": 1,
+      "codec": "PCM",
+      "format": "WAV",
+      "buffer_size": 1024,
+      "endianness": "little",
+      "compression": "none",
+      "chunk_size": 4096
+    }
+  }

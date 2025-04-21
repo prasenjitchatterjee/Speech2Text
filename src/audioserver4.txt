@@ -1,0 +1,135 @@
+"""
+@author: Paasenjit Chatterjee
+@project: Phantom
+
+This module simulates a SIP server streaming audio calls. We are using a websocket to stream a bunch of audio files from a
+directory back to back in a loop indefinitely as long as a client is there on the other hand to receive it from the socket.
+At present we have used a minimal set of headers such as 
+
+"Call-ID": currently name of the audio file,
+"Connection-Status": "Connected/Active/Disconnected",
+"Payload": Bytestream of the audio wave file that can be played or used for transciption.
+"""
+
+import asyncio
+import websockets
+import json
+import os
+import random
+import numpy as np
+import io
+from pydub import AudioSegment
+from pathlib import Path
+from utils import *
+import config_manager as cm
+
+class AudioStreamer:
+    def __init__(self, audio_folder, host="localhost", port=8765, chunk_size=4096, sample_rate=16000, channels=1):
+        self.AUDIO_FOLDER = audio_folder
+        self.HOST = host
+        self.PORT = port
+        self.CHUNK_SIZE = chunk_size
+        self.SAMPLE_RATE = sample_rate  # Default sample rate 16000 unless changed with initializing
+        self.CHANNELS = channels  # Default to mono audio unless changed with initialization
+        self.SLEEP_RANGE = (5, 15)  # Random sleep time between files (seconds)
+
+    def get_audio_files(self, folder):
+        """Retrieve all audio files (.mp3 and .wav) from the folder."""
+        return [os.path.join(folder, f) for f in os.listdir(folder) if f.endswith((".mp3", ".wav"))]
+
+
+    def read_audio(self, file_path):
+        audio = AudioSegment.from_file(file_path)
+        audio = audio.set_frame_rate(self.SAMPLE_RATE).set_channels(self.CHANNELS)
+        samples = np.array(audio.get_array_of_samples(), dtype=np.int16)
+        
+        for i in range(0, len(samples), self.CHUNK_SIZE):
+            yield samples[i:i + self.CHUNK_SIZE].tobytes()
+
+
+    async def stream_audio(self, websocket, path):
+        while True:
+            audio_files = self.get_audio_files(self.AUDIO_FOLDER)
+            for audio_file in audio_files:   #os.listdir(self.AUDIO_FOLDER):
+                # if audio_file.endswith((".wav", ".mp3")):
+                # file_path = os.path.join(self.AUDIO_FOLDER, audio_file)
+                # call_id = os.path.basename(file_path)
+                call_id = os.path.basename(audio_file)
+                
+                message = json.dumps({
+                    "Call-ID": call_id,
+                    "Connection-Status": "Connected",
+                    "Payload": None
+                })
+                try:
+                    await websocket.send(message)
+                    print(f"Streaming: {call_id}")
+                    print(f"Call-ID: {call_id} | Status: {json.loads(message)['Connection-Status']}")
+                except:
+                    # print("Could not establish connection with the client")
+                    pass
+            
+                try:
+                    # for chunk in self.read_audio(file_path):
+                    for chunk in self.read_audio(audio_file):
+                        message = json.dumps({
+                            "Call-ID": call_id,
+                            "Connection-Status": "Active",
+                            "Payload": chunk.hex()
+                        })
+                        # print(f"Call-ID: {call_id} | Status: {json.loads(message)['Connection-Status']}")
+                        try:
+                            await websocket.send(message)
+                            # print(f"Call-ID: {call_id} | Status: {json.loads(message)['Connection-Status']}")
+                        except:
+                            # print("Could not establish connection with the client")
+                            pass
+                        # await asyncio.sleep(self.CHUNK_SIZE / (self.SAMPLE_RATE * 2))  # Simulate real-time playback
+                        # await asyncio.sleep(0.1)  # Simulate real-time streaming
+                        
+                    message = json.dumps({
+                        "Call-ID": call_id,
+                        "Connection-Status": "Disconnected",
+                        "Payload": None
+                    })
+                    
+                    try:
+                        await websocket.send(message)
+                        print(f"Call-ID: {call_id} | Status: {json.loads(message)['Connection-Status']}")
+                    except:
+                        # print("Could not establish connection with the client")
+                        pass
+
+                except Exception as e:
+                    print(f"Error streaming {audio_file}: {e}")
+                
+                # Introduce a random pause before playing the next file
+                sleep_time = random.uniform(*self.SLEEP_RANGE)
+                print(f"Sleeping for {sleep_time:.2f} seconds before the next file...")
+                await asyncio.sleep(sleep_time)
+       
+            
+            await asyncio.sleep(1)  # Delay before restarting loop
+
+
+    async def start_server(self):
+        server = await websockets.serve(self.stream_audio, self.HOST, self.PORT)
+        console_log(f"SIP Server started at ws://{self.HOST}:{self.PORT}")
+        await server.wait_closed()
+
+
+
+if __name__ == "__main__":
+    p = Path().resolve()
+    a = Path(p, "audio_test")
+    audio_folder = str(a) # Folder containing audio files
+
+    audio_config_data = cm.read_config("audio_config")
+    network_config_data = cm.read_config("network_config")
+
+    streamer = AudioStreamer(audio_folder)
+
+    try:
+        asyncio.run(streamer.start_server())
+    except KeyboardInterrupt:
+        pass

@@ -1,0 +1,12 @@
+def get_hfaccess_token():
+    file_path = r"C:\Users\pcmob\Documents\Codes\Python\huggingface_access_token.txt"
+    try:
+        with open(file_path, 'r') as file:
+            content = file.read()
+        return content
+    except FileNotFoundError:
+        print(f"Error: File not found at path: {file_path}")
+        return None
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        return None

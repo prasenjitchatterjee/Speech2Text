@@ -1,0 +1,138 @@
+# from pyannote.audio.pipelines.speaker_diarization import SpeakerDiarization
+# from pyannote.core import Segment
+# from huggingface_token import get_hfaccess_token
+
+# class DiarizationPipeline:
+#     def __init__(self, model_checkpoint: str):
+#         self.pipeline = SpeakerDiarization.from_pretrained(model_checkpoint, use_auth_token=get_hfaccess_token())
+    
+#     def diarize(self, audio_file: str):
+#         return self.pipeline(audio_file)
+
+# import warnings
+# warnings.filterwarnings("ignore")
+
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", module="pyannote.audio")
+warnings.filterwarnings("ignore", module="pytorch_lightning")
+warnings.filterwarnings("ignore", message=".*Model was trained with.*")
+
+import logging
+
+# Suppress speechbrain logging
+logging.getLogger("speechbrain").setLevel(logging.ERROR)
+logging.getLogger("pyannote.audio").setLevel(logging.ERROR)
+logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
+logging.getLogger().setLevel(logging.ERROR)
+
+import asyncio
+from pyannote.audio import Pipeline
+from pyannote.core import Segment
+from pyannote.core import Annotation
+# from pyannote.audio.pipelines import SpeakerEmbedding
+from pyannote.audio import Model
+# from pyannote.audio.pipelines.utils.hook import ProgressHook
+from huggingface_token import get_hfaccess_token
+import torch
+
+from scipy.spatial.distance import cosine
+import numpy as np
+
+# audio_data = r"..\audio\call02.wav"
+
+class DiarizationPipeline:
+
+    def __init__(self, audio_data=None, sample_rate=16000, chunk_size =2**16) :
+
+        import warnings
+        # warnings.filterwarnings("ignore", category=UserWarning)
+        warnings.filterwarnings("ignore", message=".*Model was trained with.*")
+
+
+        import logging
+        # Suppress speechbrain logging
+        logging.getLogger().setLevel(logging.ERROR)
+        logging.getLogger("speechbrain").setLevel(logging.ERROR)
+        logging.getLogger("torch").setLevel(logging.ERROR)
+        logging.getLogger("pyannote.audio").setLevel(logging.ERROR)
+        logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
+        
+        
+        # pyannote/speaker-diarization-3.1
+        __access_token = get_hfaccess_token()
+        self.audio_data = audio_data
+        self.sample_rate = sample_rate
+        self.chunk_size = chunk_size
+        self.pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=__access_token)
+        
+        # self.embedding_model = Model.from_pretrained("pyannote/embedding", use_auth_token=__access_token)
+
+        # send pipeline to GPU (if available)
+        self.pipeline.to(torch.device("cuda"))
+
+
+    def crop_audio_segment(self, audio_chunk: np.ndarray, sample_rate: int, segment: Segment):
+        """Extracts a segment from a NumPy array based on start & end time."""
+        start_sample = int(segment.start * sample_rate)
+        end_sample = int(segment.end * sample_rate)
+        return audio_chunk[start_sample:end_sample]
+
+
+    def diarize_audio_stream(self):
+        if self.audio_data is None:
+            print("No audio stream passed to get diarized")
+            return
+        
+        audio_samples = np.frombuffer(self.audio_data, dtype=np.int16).astype(np.float32) / 32768.0  # Normalize
+        # Create fake segment duration (since Pyannote expects a full segment)
+        duration = len(audio_samples) / self.sample_rate  # Assuming 16kHz sample rate
+        segment = Segment(0, duration)
+        
+        diarization = self.pipeline({'waveform': torch.tensor(audio_samples).unsqueeze(0), 'sample_rate':self.sample_rate})
+        embeddings = {}  # Store embeddings per speaker
+        for turn, _, speaker in diarization.itertracks(yield_label=True):
+            # print(f"start={turn.start:.1f}s stop={turn.end:.1f}s speaker_{speaker}")
+
+            segment_audio = self.crop_audio_segment(audio_samples, self.sample_rate, turn)  # Crop audio segment
+            segment_audio_tensor = torch.tensor(segment_audio).float().unsqueeze(0)  # Convert to tensor
+
+            # embedding = self.embedding_model(segment_audio_tensor)  # Extract embedding
+            # embeddings[speaker] = embedding.detach().cpu().numpy().flatten()
+            
+        return diarization, embeddings
+
+
+   
+if __name__ == "__main__":
+
+    from pydub import AudioSegment
+    import numpy as np
+
+    file_path = r"..\audio\call02.wav"
+    sample_rate = 16000
+    chunk_size = 2**24
+    channels = 1
+
+    def read_audio(file_path):
+        audio = AudioSegment.from_file(file_path)
+        audio = audio.set_frame_rate(sample_rate).set_channels(channels)
+        samples = np.array(audio.get_array_of_samples(), dtype=np.int16)
+        chunk_size = 2**24 if len(samples) > 2**24 else len(samples)
+
+        print(chunk_size)
+
+        for i in range(0, len(samples), chunk_size):
+            yield samples[i:i + chunk_size].tobytes()
+
+    i= 1
+    for audio_chunk in read_audio(file_path):
+        # print(len(audio_chunk))
+        # audio_samples = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32) / 32768.0  # Normalize
+        # # Create fake segment duration (since Pyannote expects a full segment)
+        # duration = len(audio_samples) / sample_rate  # Assuming 16kHz sample rate
+        # segment = Segment(0, duration)
+        print(f'chunk - {i}\n')
+        diarizer = DiarizationPipeline(audio_chunk)
+        diarizer.diarize()
+        i+=1

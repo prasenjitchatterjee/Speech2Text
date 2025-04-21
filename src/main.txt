@@ -1,0 +1,42 @@
+import os
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+import warnings
+warnings.simplefilter('ignore') # In any case, try to avoid warnings as much as possible.
+warnings.simplefilter('ignore', SyntaxWarning) # Use this instead if you can limit the type of warning.
+
+from transformers.utils import logging
+logging.set_verbosity_error() 
+
+from audio_manager import *
+from diarization_manager import *
+from transcription_manager import *
+from utils import *
+
+
+if __name__ == '__main__':
+    console_log("loading audio")
+    filename = r'..\audio\F_0101_15y2m_1.wav'
+    audio_file = load_audio(filename)
+
+    console_log("loading diarization model")
+    diarization_pipeline = DiarizationPipeline("pyannote/speaker-diarization")
+    console_log("diarization model loaded")
+
+    console_log("diazrization started")
+    diarization_result = diarization_pipeline.diarize(audio_file)
+    console_log("diazrization ended")
+
+    print(diarization_result)
+
+    console_log("diarized audio segmentation started")
+    split_diarized_audio(audio_file, diarization_result)
+    console_log("diarized audio segmentation ended")
+
+    console_log("audio transcription started")
+    transcribe_audio(audio_file, diarization_result)
+    console_log("audio transcription ended")
+
+
+
+
+

@@ -1,0 +1,91 @@
+import whisper
+import os
+from utils import *
+import numpy as np
+import json
+
+
+class TranscriptionPipeline():
+    def __init__(self,model="tiny"):
+        self.whisper_model = whisper.load_model(model)
+
+
+    def transcribe_audio(self, audio_file, diarization_result, output_dir = r"speaker_segments"):
+        # Load audio file
+        # audio = AudioSegment.from_wav(audio_file)
+
+        for i, (segment, _, speaker) in enumerate(diarization_result.itertracks(yield_label=True)):
+            # print("segment: ", segment)
+            start_time = int(segment.start * 1000)  # Convert to milliseconds
+            end_time = int(segment.end * 1000)
+
+            # Extract segment
+            # segment_audio = audio[start_time:end_time]
+            segment_filename = os.path.join(output_dir, f"{speaker}_{i}.wav")
+            # segment_audio.export(segment_filename, format="wav")
+
+            # console_log("loading whishper")
+            # self.whisper_model = whisper.load_model("base")
+            # console_log("whishper loaded")
+
+            # Transcribe with Whisper
+            print("\n\n")
+            console_log("Transcription begins for segment: " + str(segment))
+            transcription = self.whisper_model.transcribe(segment_filename)
+            
+            # Output results
+            console_log(f"{speaker}: {transcription['text']}")
+
+
+    # old function needs to be deleted, had some bug.
+    # def transcribe_audio_stream2(self,audio_data, diarization_result):
+    #     # self.whisper_model = whisper.load_model("base")
+    #     for i, (segment, _, speaker) in enumerate(diarization_result.itertracks(yield_label=True)):
+    #         # print("segment: ", segment)
+    #         start_time = int(segment.start * 1000)  # Convert to milliseconds
+    #         end_time = int(segment.end * 1000)
+    #         audio_samples = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0  # Normalize
+    #         transcription = self.whisper_model.transcribe(audio_samples)
+    #         result = f"{speaker}: {transcription['text']}"
+    #         print(result)
+
+
+    def transcribe_audio_stream(self,audio_data, diarization_result):
+        response_messages = []
+        sample_rate = 16000  # Assuming 16kHz sample rate
+        for i, (segment, _, speaker) in enumerate(diarization_result.itertracks(yield_label=True)):
+            start_time = int(segment.start * 1000)  # Convert to milliseconds
+            end_time = int(segment.end * 1000)
+
+            # Convert time to sample indices
+            start_sample = int((start_time / 1000) * sample_rate)
+            end_sample = int((end_time / 1000) * sample_rate)
+            
+            audio_samples = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0  # Normalize
+
+            # Extract the corresponding audio segment
+            speaker_audio = audio_samples[start_sample:end_sample]
+
+            # Convert back to int16 before passing to Whisper (if needed)
+            # speaker_audio_int16 = (speaker_audio * 32768).astype(np.int16)
+
+            # print(f"Speaker {speaker}: Segment {i} -> Start: {start_time}ms, End: {end_time}ms, Samples: {len(speaker_audio)}")
+
+            # Pass the extracted segment to Whisper
+            # transcription = self.whisper_model.transcribe(speaker_audio_int16, sample_rate=sample_rate)
+            transcription = self.whisper_model.transcribe(speaker_audio)
+            
+            # print(f"Speaker {speaker} [{segment.start} - {segment.end}]: {transcription['text']}")
+            
+            response_message = {
+                    "speaker": speaker,
+                    "start_time": segment.start,
+                    "end_time": segment.end,
+                    "text": transcription['text']
+                }
+            # print(response_message)
+            response_messages.append(response_message)
+            # print(response_messages)
+            
+        return response_messages
+
