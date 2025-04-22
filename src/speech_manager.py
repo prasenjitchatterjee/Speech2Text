@@ -1,0 +1,168 @@
+
+import multiprocessing as mp
+import time
+import json
+import numpy as np
+from utils import *
+from scipy.spatial.distance import cosine
+import queue
+
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
+console_log("""Audio Client has invoked Speech manager which handles diarization and transcription of audio streams in real time.
+            It takes some time time to load the models for the first time.
+            Once the models are loaded in memory, it will proceed to listen the audio streams and initiate the transcription process.""")
+console_log('Loading diarization manager.....')
+import diarization_manager as dm
+console_log('Diarization manager loaded')
+console_log('Loading transcription manager.....')
+import transcription_manager as tm
+console_log('Transcription manager loaded')
+
+class SpeechPipeline():
+
+    # audio_queue = queue.Queue()
+
+    def __init__(self, speech_buffer=b"", sample_rate=16000, speech_buffer_len=2*18):
+        self.connection_status = "Disconnected"
+        self.sample_rate = sample_rate
+        self.audio_queue = mp.Queue()
+        self.process = mp.Process(target=self.worker_loop)
+        self.process.daemon = True
+        self.process.start()
+        self.speaker_profiles = {}
+
+
+    def enqueue_audio(self, call_id, audio_data, status):
+        self.audio_queue.put((call_id, audio_data, status))
+
+
+    def worker_loop(self):
+        while True:
+            try:
+                call_id, audio_data, status = self.audio_queue.get()
+                if status in ['Connected', 'Disconnected']:
+                    self.reset()
+                    continue
+                self.process_audio(call_id, audio_data)
+            except Exception as e:
+                console_log(f"[Worker] Error: {e}")
+
+    def reset(self):
+        self.call_id = ""
+        self.speech_buffer = b""
+        self.start_time = 0
+        self.end_time = 0
+        self.speaker_profiles.clear()
+
+
+    def get_audio(call_id,status, audio_data):
+        SpeechPipeline.audio_queue.put({call_id,status, audio_data})
+
+    def calculate_audio_duration(self, audio_data: bytes, sample_rate: int = 16000 , num_channels: int = 1 , bit_depth: int= 16) -> float:
+        bytes_per_sample = bit_depth // 8  # Convert bit depth to bytes
+        total_samples = len(audio_data) // (num_channels * bytes_per_sample)
+        duration = total_samples / sample_rate
+        return duration
+    
+
+    def match_speaker(self,new_embedding):
+        """Match speaker with previous embeddings using cosine similarity."""
+        if not self.speaker_profiles:
+            return None  # No previous speakers yet
+
+        best_match = None
+        best_score = float("inf")
+
+        for speaker_id, prev_embedding in self.speaker_profiles.items():
+            # Ensure both vectors are 1D
+            new_embedding = new_embedding.flatten()
+            prev_embedding = prev_embedding.flatten()
+
+            # Debugging: Print shape
+            print(f"Comparing embeddings - New: {new_embedding.shape}, Prev: {prev_embedding.shape}")
+
+            score = cosine(new_embedding, prev_embedding)
+            if score < best_score:
+                best_score = score
+                best_match = speaker_id
+
+        return best_match if best_score < 0.3 else None  # Set threshold for matching
+        
+    
+    def process_chunk(self, audio_chunk: np.ndarray, speaker_embeddings):
+        """Process each audio chunk and assign consistent speaker IDs."""
+        new_embeddings = speaker_embeddings
+        new_diarization = dm.Annotation()
+
+        for speaker, embedding in new_embeddings.items():
+            matched_speaker = self.match_speaker(embedding)
+            if matched_speaker is None:
+                matched_speaker = len(self.speaker_profiles)  # Assign new ID
+                self.speaker_profiles[matched_speaker] = embedding  # Store new speaker embedding
+            
+            # Add speaker annotation with matched speaker ID
+            new_diarization[dm.Segment(0, len(audio_chunk) / self.sample_rate)] = matched_speaker
+
+        return new_diarization
+    
+    def process_audio(self, call_id, audio_data):
+        duration = self.calculate_audio_duration(audio_data)
+        diarization_result, speaker_embeddings = self.diarize_call(audio_data)
+        updated_result = self.process_chunk(audio_data, speaker_embeddings)
+        transcriptions = self.transcribe_call(audio_data, diarization_result)
+
+        end_time = 0
+        for t in transcriptions:
+            speaker = t["speaker"]
+            start = t["start_time"]
+            end = t.get("end_time", 0)
+            end_time += (end - start)
+            text = t["text"]
+            print(f"Speaker {speaker} [{start:.1f} - {end_time:.1f}]: {text}")
+    
+
+    # def process_audio(self, call_id, audio_data, status):
+    #     if status == 'Connected' or status == 'Disconnected':
+    #         #reset everything
+    #         self.call_id = ""
+    #         self.speech_buffer = b""
+    #         self.start_time = 0
+    #         self.end_time = 0
+    #         return
+
+    #     self.call_id = call_id
+    #     self.speech_buffer += audio_data
+    #     duration = self.calculate_audio_duration(audio_data)
+    #     diarization_results = self.diarize_call(audio_data)
+        
+    #     diarization_result = diarization_results[0]
+    #     speaker_embeddings = diarization_results[1]
+
+    #     updated_diarization_result = self.process_chunk(audio_data, speaker_embeddings)
+
+    #     print("---------->", updated_diarization_result,"<----------------")
+        
+    #     transcriptions_list = self.transcribe_call(audio_data, diarization_result)
+
+    #     for transcription_data in transcriptions_list:
+    #         speaker = transcription_data["speaker"]
+    #         start_time = transcription_data["start_time"]
+    #         self.start_time = self.end_time
+    #         end_time = transcription_data.get("end_time", 0)
+    #         self.end_time += (end_time - start_time)
+    #         text = transcription_data["text"]
+    #         print(f"Speaker {speaker} [{self.start_time:.1f} - {self.end_time:.1f}]: {text}")
+        
+
+      
+    
+    def diarize_call(self, audio_data) :
+        d = dm.DiarizationPipeline(audio_data)
+        diarization_result = d.diarize_audio_stream()
+        return diarization_result
+
+    def transcribe_call(self, audio_data, diarization_result):
+        t = tm.TranscriptionPipeline()
+        return t.transcribe_audio_stream(audio_data, diarization_result)

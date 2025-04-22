@@ -1,0 +1,118 @@
+import asyncio
+import websockets
+import json
+import io
+import numpy as np
+import pyaudio
+# from diarization_manager import *
+# from transcription_manager import *
+# from speech_manager import *
+import multiprocessing as mp
+from utils import *
+import config_manager as cm
+import speech_manager as sp
+
+
+
+class AudioStreamClient:
+    def __init__(self, host="localhost", port=8765, sample_rate=16000, channels=1, sample_width=2,chunk_size=4096):
+        self.HOST = host
+        self.PORT = port
+        self.uri = f"ws://{self.HOST}:{self.PORT}"
+        self.CHUNK_SIZE = chunk_size
+        self.SAMPLE_RATE = sample_rate
+        self.CHANNELS = channels
+        self.FORMAT = pyaudio.paInt16  # 16-bit PCM
+        self.sample_width = sample_width
+        self.pyaudio_instance = pyaudio.PyAudio()
+        self.stream = self.pyaudio_instance.open(format=self.FORMAT, channels=self.CHANNELS, rate=self.SAMPLE_RATE, output=True, frames_per_buffer=self.CHUNK_SIZE)
+     
+        self.sp = sp.SpeechPipeline()
+
+
+    async def listen(self):
+      
+        while True:
+            try:
+                async with websockets.connect(self.uri) as websocket:
+                    console_log("Connected to SIP server.")
+                    
+                    async for message in websocket:
+                        data = json.loads(message)
+                        call_id = data.get("Call-ID", "Unknown")
+                        status = data.get("Connection-Status", "Unknown")
+                        payload = data.get("Payload", None)
+                        
+                        # console_log(f"Call-ID: {call_id} | Status: {status}")
+
+                        if (status == "Connected") or (status == "Disconnected") :
+                            console_log("Call " + status + " with id: " + call_id)
+                            self.sp.enqueue_audio(call_id, b"", status)
+                            buffer =b""
+                            start_time = 0
+                            last_time = 0
+                            # self.sp.process_audio(call_id, buffer, status)
+                        
+                        if payload:
+                            audio_data = bytes.fromhex(payload)
+                            # self.process = mp.Process(target=self.play_audio, args=(audio_data,))
+                            # self.process.start()
+                            self.play_audio(audio_data)
+
+                            buffer +=audio_data
+                            
+                            if len(buffer) >= 2**18:
+                                # last_time += self.sp.process_audio(call_id, audio_data)
+                                # print(f"Start time: {start_time:.2f} and Last time: {last_time:.2f}")
+                                # print(f"Start time: {start_time} and Last time: {last_time}")
+
+#######################################################################################################################
+
+                                # print("len-buffer: ", len(buffer))
+                                # d = DiarizationPipeline(buffer)
+                                # diarization_result = d.diarize()
+                                # t = TranscriptionPipeline()
+                                # t.transcribe_audio_stream(buffer, diarization_result)
+
+                                # print("len-buffer: ", len(buffer))
+
+                                # self.sp.process_audio(call_id, buffer, status)
+                                self.sp.enqueue_audio(call_id, buffer, status)
+
+########################################################################################################################
+                                buffer = b""
+                                # start_time = last_time
+            
+            except (websockets.exceptions.ConnectionClosed, ConnectionRefusedError):
+                console_log("Server not available. Reconnecting...")
+                await asyncio.sleep(2)  # Wait 2 secs before retrying
+
+
+    def play_audio(self, audio_data):
+        try:
+            self.stream.write(audio_data)
+        except:
+            pass
+
+    def close_stream(self):
+        if self.stream:
+            self.stream.stop_stream()
+            self.stream.close()
+        self.pyaudio_instance.terminate()
+
+
+
+if __name__ == "__main__":
+    audio_config_data = cm.read_config("audio_config")
+    network_config_data = cm.read_config("network_config")
+
+    client = AudioStreamClient(host=network_config_data["host"],
+                               port=network_config_data["port"],
+                               sample_rate=audio_config_data["sample_rate"],
+                               channels=audio_config_data["channels"],
+                               chunk_size=audio_config_data["chunk_size"]
+                               )
+    try:
+        asyncio.run(client.listen())
+    except KeyboardInterrupt:
+        client.close_stream()
