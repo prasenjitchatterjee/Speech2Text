@@ -1,0 +1,17 @@
+# Global load once per GPU
+pipes = [pipeline(...) for i in range(torch.cuda.device_count())]
+
+
+from concurrent.futures import ThreadPoolExecutor
+executor = ThreadPoolExecutor()
+
+@app.post("/transcribe")
+async def transcribe(files: List[UploadFile] = File(...)):
+    contents = await asyncio.gather(*[f.read() for f in files])
+    # Run decoding & inference in background thread
+    loop = asyncio.get_event_loop()
+    results = await loop.run_in_executor(executor, run_transcription, contents)
+    return results
+
+
+uvicorn app:app --host 0.0.0.0 --port 8000 --workers 1
