@@ -1,0 +1,70 @@
+from fastapi import FastAPI, File, UploadFile
+from typing import List
+from transformers import pipeline
+from concurrent.futures import ThreadPoolExecutor
+import torch
+
+app = FastAPI()
+
+# -----------------------------
+# Load one Whisper pipeline per GPU
+# -----------------------------
+model_id = "openai/whisper-large-v3-turbo"
+num_gpus = torch.cuda.device_count()
+
+if num_gpus == 0:
+    raise RuntimeError("No GPUs available")
+
+pipes = [
+    pipeline(
+        "automatic-speech-recognition",
+        model=model_id,
+        device=i,
+        torch_dtype=torch.float16
+    )
+    for i in range(num_gpus)
+]
+
+# -----------------------------
+# Split data evenly across GPUs
+# -----------------------------
+def split_data(data, num_chunks):
+    chunk_size = len(data) // num_chunks
+    remainder = len(data) % num_chunks
+    splits = []
+    start = 0
+    for i in range(num_chunks):
+        end = start + chunk_size + (1 if i < remainder else 0)
+        splits.append(data[start:end])
+        start = end
+    return splits
+
+# -----------------------------
+# Inference function
+# -----------------------------
+def transcribe(pipe, audio_bytes_batch, filenames):
+    results = pipe(audio_bytes_batch, batch_size=4)
+    return [
+        {"filename": filenames[i], "transcript": results[i]["text"]}
+        for i in range(len(results))
+    ]
+
+# -----------------------------
+# API endpoint
+# -----------------------------
+@app.post("/transcribe")
+async def transcribe_audio(files: List[UploadFile] = File(...)):
+    audio_bytes_list = [await f.read() for f in files]
+    filenames = [f.filename for f in files]
+
+    # Split files equally among GPUs
+    audio_splits = split_data(audio_bytes_list, num_gpus)
+    filename_splits = split_data(filenames, num_gpus)
+
+    # Run transcription in parallel across GPUs
+    with ThreadPoolExecutor(max_workers=num_gpus) as executor:
+        results = list(executor.map(transcribe, pipes, audio_splits, filename_splits))
+
+    # Flatten results
+    all_results = [item for sublist in results for item in sublist]
+    return all_results
