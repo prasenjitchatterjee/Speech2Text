@@ -1,0 +1,24 @@
+Repo,Folder,File / Folder,Needed for Inference?,URL
+pyannote/speaker-diarization-3.1,—,config.yaml, Yes,https://huggingface.co/pyannote/speaker-diarization-3.1/blob/main/config.yaml
+pyannote/speaker-diarization-3.1,—,handler.py, No,https://huggingface.co/pyannote/speaker-diarization-3.1/blob/main/handler.py
+pyannote/speaker-diarization-3.1,—,requirements.txt, No,https://huggingface.co/pyannote/speaker-diarization-3.1/blob/main/requirements.txt
+pyannote/speaker-diarization-3.1,—,README.md, No,https://huggingface.co/pyannote/speaker-diarization-3.1/blob/main/README.md
+pyannote/speaker-diarization-3.1,—,.gitattributes, No,https://huggingface.co/pyannote/speaker-diarization-3.1/blob/main/.gitattributes
+pyannote/speaker-diarization-3.1,.github,(folder), No,https://huggingface.co/pyannote/speaker-diarization-3.1/tree/main/.github
+pyannote/speaker-diarization-3.1,reproducible_research,(folder), No,https://huggingface.co/pyannote/speaker-diarization-3.1/tree/main/reproducible_research
+pyannote/segmentation-3.0,—,config.yaml, Yes,https://huggingface.co/pyannote/segmentation-3.0/blob/main/config.yaml
+pyannote/segmentation-3.0,—,pytorch_model.bin, Yes,https://huggingface.co/pyannote/segmentation-3.0/blob/main/pytorch_model.bin
+pyannote/segmentation-3.0,—,.gitattributes, No,https://huggingface.co/pyannote/segmentation-3.0/blob/main/.gitattributes
+pyannote/segmentation-3.0,—,LICENSE, No,https://huggingface.co/pyannote/segmentation-3.0/blob/main/LICENSE
+pyannote/segmentation-3.0,—,README.md, No,https://huggingface.co/pyannote/segmentation-3.0/blob/main/README.md
+pyannote/segmentation-3.0,—,example.png, No,https://huggingface.co/pyannote/segmentation-3.0/blob/main/example.png
+pyannote/embedding,—,config.yaml, Yes,https://huggingface.co/pyannote/embedding/blob/main/config.yaml
+pyannote/embedding,—,pytorch_model.bin, Yes,https://huggingface.co/pyannote/embedding/blob/main/pytorch_model.bin
+pyannote/embedding,—,.gitattributes, No,https://huggingface.co/pyannote/embedding/blob/main/.gitattributes
+pyannote/embedding,—,LICENSE, No,https://huggingface.co/pyannote/embedding/blob/main/LICENSE
+pyannote/embedding,—,README.md, No,https://huggingface.co/pyannote/embedding/blob/main/README.md
+pyannote/embedding,—,hparams.yaml, No,https://huggingface.co/pyannote/embedding/blob/main/hparams.yaml
+pyannote/embedding,—,hydra.yaml, No,https://huggingface.co/pyannote/embedding/blob/main/hydra.yaml
+pyannote/embedding,—,overrides.yaml, No,https://huggingface.co/pyannote/embedding/blob/main/overrides.yaml
+pyannote/embedding,—,tfevents.bin, No,https://huggingface.co/pyannote/embedding/blob/main/tfevents.bin
+pyannote/embedding,—,train.log, No,https://huggingface.co/pyannote/embedding/blob/main/train.log
