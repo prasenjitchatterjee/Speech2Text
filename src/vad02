@@ -1,0 +1,140 @@
+def merge_close_timestamps(timestamps, min_gap=1.0):
+    """
+    Merge consecutive timestamps that are closer than min_gap seconds.
+    
+    Parameters:
+    - timestamps: List of (start_time, end_time) tuples
+    - min_gap: Minimum gap in seconds between segments (default: 1.0)
+    
+    Returns:
+    - List of merged (start_time, end_time) tuples
+    """
+    if not timestamps:
+        return []
+    
+    # Sort timestamps by start time (just in case)
+    sorted_timestamps = sorted(timestamps, key=lambda x: x[0])
+    
+    merged = []
+    current_start, current_end = sorted_timestamps[0]
+    
+    for start, end in sorted_timestamps[1:]:
+        # If gap between current segment and next is less than min_gap, merge them
+        if start - current_end < min_gap:
+            # Extend the current segment
+            current_end = end
+        else:
+            # Save the current segment and start a new one
+            merged.append((current_start, current_end))
+            current_start, current_end = start, end
+    
+    # Don't forget the last segment
+    merged.append((current_start, current_end))
+    
+    return merged
+
+
+def frames_to_timestamps(voice_frames, hop_length, sr, audio_length):
+    """Helper function to convert frame indices to timestamps."""
+    timestamps = []
+    in_voice = False
+    start_time = 0
+    
+    for i, is_voice in enumerate(voice_frames):
+        time = i * hop_length / sr
+        
+        if is_voice and not in_voice:
+            start_time = time
+            in_voice = True
+        elif not is_voice and in_voice:
+            timestamps.append((start_time, time))
+            in_voice = False
+    
+    if in_voice:
+        timestamps.append((start_time, audio_length / sr))
+    
+    return timestamps
+
+
+def detect_voice_activity_robust(audio, sr, frame_length=2048, hop_length=512):
+    """
+    Combine multiple features for more robust detection in noise.
+    """
+    import librosa
+    
+    if audio.ndim == 2:
+        channels = [audio[:, 0], audio[:, 1]]
+    else:
+        channels = [audio]
+    
+    results = []
+    
+    for ch_idx, channel in enumerate(channels):
+        # Feature 1: Spectral Centroid (voice typically has higher centroid)
+        spectral_centroid = librosa.feature.spectral_centroid(
+            y=channel, sr=sr, n_fft=frame_length, hop_length=hop_length
+        )[0]
+        
+        # Feature 2: Spectral Rolloff
+        spectral_rolloff = librosa.feature.spectral_rolloff(
+            y=channel, sr=sr, n_fft=frame_length, hop_length=hop_length
+        )[0]
+        
+        # Feature 3: RMS Energy
+        rms = librosa.feature.rms(
+            y=channel, frame_length=frame_length, hop_length=hop_length
+        )[0]
+        
+        # Feature 4: Zero-Crossing Rate
+        zcr = librosa.feature.zero_crossing_rate(
+            channel, frame_length=frame_length, hop_length=hop_length
+        )[0]
+        
+        # Normalize all features
+        spectral_centroid = (spectral_centroid - np.mean(spectral_centroid)) / (np.std(spectral_centroid) + 1e-10)
+        rms = (rms - np.mean(rms)) / (np.std(rms) + 1e-10)
+        zcr = (zcr - np.mean(zcr)) / (np.std(zcr) + 1e-10)
+        
+        # Voice detection based on multiple criteria
+        # Voice typically has: moderate-to-high energy, higher spectral centroid, moderate ZCR
+        voice_frames = (
+            (rms > 0.5) &  # Energy threshold
+            (spectral_centroid > -0.5) &  # Spectral content
+            (zcr > -0.5) & (zcr < 2.0)  # ZCR in reasonable range
+        )
+        
+        # Convert to timestamps
+        timestamps = frames_to_timestamps(voice_frames, hop_length, sr, len(channel))
+        timestamps = merge_close_timestamps(timestamps, min_gap=1.0)
+        
+        results.append(timestamps)
+        print(f"Channel {ch_idx}: Found {len(timestamps)} voice segments")
+    
+    return results
+
+
+# Usage
+from scipy.io import wavfile
+import numpy as np
+
+sr, audio = wavfile.read('calls/final_call_conversation_dual_channel_overlap3.wav')
+audio = audio.astype(np.float32) / 32768.0
+
+print(f"Audio shape: {audio.shape}")
+print(f"Sample rate: {sr}")
+print(f"Duration: {len(audio) / sr:.2f} seconds")
+
+# Detect voice activity with merging
+timestamps = detect_voice_activity_robust(
+    audio, sr
+
+)
+
+print("\n=== Voice Activity Timestamps (Merged) ===")
+print("\nChannel 0 (Left):")
+for start, end in timestamps[0]:
+    print(f"  {start:.2f}s - {end:.2f}s (duration: {end-start:.2f}s)")
+
+print("\nChannel 1 (Right):")
+for start, end in timestamps[1]:
+    print(f"  {start:.2f}s - {end:.2f}s (duration: {end-start:.2f}s)")
