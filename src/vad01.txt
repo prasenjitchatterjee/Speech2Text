@@ -1,0 +1,134 @@
+def merge_close_timestamps(timestamps, min_gap=1.0):
+    """
+    Merge consecutive timestamps that are closer than min_gap seconds.
+    
+    Parameters:
+    - timestamps: List of (start_time, end_time) tuples
+    - min_gap: Minimum gap in seconds between segments (default: 1.0)
+    
+    Returns:
+    - List of merged (start_time, end_time) tuples
+    """
+    if not timestamps:
+        return []
+    
+    # Sort timestamps by start time (just in case)
+    sorted_timestamps = sorted(timestamps, key=lambda x: x[0])
+    
+    merged = []
+    current_start, current_end = sorted_timestamps[0]
+    
+    for start, end in sorted_timestamps[1:]:
+        # If gap between current segment and next is less than min_gap, merge them
+        if start - current_end < min_gap:
+            # Extend the current segment
+            current_end = end
+        else:
+            # Save the current segment and start a new one
+            merged.append((current_start, current_end))
+            current_start, current_end = start, end
+    
+    # Don't forget the last segment
+    merged.append((current_start, current_end))
+    
+    return merged
+
+
+# Updated main function
+def detect_voice_activity_energy(audio, sr, frame_length=2048, hop_length=512, 
+                                 energy_threshold=0.02, merge_gap=1.0):
+    """
+    Detect voice activity based on energy threshold.
+    
+    Parameters:
+    - audio: numpy array (can be stereo or mono)
+    - sr: sample rate
+    - frame_length: size of analysis window
+    - hop_length: step size between frames
+    - energy_threshold: threshold for voice detection (adjust based on audio)
+    - merge_gap: merge segments closer than this many seconds (default: 1.0)
+    
+    Returns:
+    - List of (start_time, end_time) tuples for each channel
+    """
+    # Handle stereo - scipy returns shape (samples, channels) for stereo
+    if audio.ndim == 2:
+        channels = [audio[:, 0], audio[:, 1]]
+    else:
+        channels = [audio]
+    
+    results = []
+    
+    for ch_idx, channel in enumerate(channels):
+        # Calculate short-time energy
+        energy = []
+        for i in range(0, len(channel) - frame_length, hop_length):
+            frame_energy = np.sum(channel[i:i+frame_length]**2)
+            energy.append(frame_energy)
+        
+        energy = np.array(energy)
+        
+        if len(energy) == 0:
+            print(f"Warning: Channel {ch_idx} is too short for the given frame_length")
+            results.append([])
+            continue
+        
+        # Normalize energy
+        max_energy = np.max(energy)
+        if max_energy > 0:
+            energy = energy / max_energy
+        
+        # Detect voice activity
+        voice_frames = energy > energy_threshold
+        
+        # Convert frames to timestamps
+        timestamps = []
+        in_voice = False
+        start_time = 0
+        
+        for i, is_voice in enumerate(voice_frames):
+            time = i * hop_length / sr
+            
+            if is_voice and not in_voice:
+                start_time = time
+                in_voice = True
+            elif not is_voice and in_voice:
+                timestamps.append((start_time, time))
+                in_voice = False
+        
+        if in_voice:
+            timestamps.append((start_time, len(channel) / sr))
+        
+        # Merge close timestamps
+        if merge_gap > 0:
+            timestamps = merge_close_timestamps(timestamps, merge_gap)
+        
+        results.append(timestamps)
+        print(f"Channel {ch_idx}: Found {len(timestamps)} voice segments (after merging)")
+    
+    return results
+
+
+# Usage
+sr, audio = wavfile.read('calls/final_call_conversation_dual_channel_overlap3.wav')
+audio = audio.astype(np.float32) / 32768.0
+
+print(f"Audio shape: {audio.shape}")
+print(f"Sample rate: {sr}")
+print(f"Duration: {len(audio) / sr:.2f} seconds")
+
+# Detect voice activity with merging
+timestamps = detect_voice_activity_energy(
+    audio, sr, 
+    energy_threshold=0.015,
+    merge_gap=1.0  # Merge segments less than 1 second apart
+)
+
+print("\n=== Voice Activity Timestamps (Merged) ===")
+print("\nChannel 0 (Left):")
+for start, end in timestamps[0]:
+    print(f"  {start:.2f}s - {end:.2f}s (duration: {end-start:.2f}s)")
+
+print("\nChannel 1 (Right):")
+for start, end in timestamps[1]:
+    print(f"  {start:.2f}s - {end:.2f}s (duration: {end-start:.2f}s)")
