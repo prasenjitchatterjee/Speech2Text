@@ -1,0 +1,939 @@
+
+
+def combine_channel_text(channel_segment):
+    if not channel_segment:
+        return ""
+    # combined_text = " ".join(segment.get('text', '').strip() for segment in channel_segment['text']) #not stripping at this stage to lose positons
+    # combined_text = " ".join([entry['text'] for entry in channel_segment]) #next line is better
+    combined_text = " ".join(entry.get("text", "") for entry in channel_segment) #entry.get() is a safety measure, in case "text" is missing
+
+    return combined_text
+
+# ----------------------------------------------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------------------------------------------
+# This is a very useful function and used to find positions of texts in a language agnostic way from within a string.
+# Please note this is not being directly called from any of the following functions, but it can be used to verify if
+# we have calucated our start_pos and end_pos correctly or not
+
+import unicodedata
+
+def find_fuzzy_match_indices(main_string: str, subtext: str, ignore_diacritics: bool = True):
+    """
+    Finds the 1-based (inclusive) start and end index of 'subtext' inside 'main_string',
+    ignoring punctuation, spacing, and optionally diacritics — across all languages.
+    
+    Works with English, Arabic, Mandarin, Hindi, Japanese, etc.
+    
+    Parameters:
+        main_string (str): The full string to search within.
+        subtext (str): The text to search for.
+        ignore_diacritics (bool): If True, strips diacritics before comparison.
+    
+    Returns:
+        (start_index, end_index) as 1-based inclusive tuple if found, else None.
+    """
+
+    def strip_diacritics(text: str) -> str:
+        """Remove combining diacritical marks from text safely for any Unicode script."""
+        return ''.join(
+            ch for ch in unicodedata.normalize('NFD', text)
+            if unicodedata.category(ch) != 'Mn'
+        )
+
+    def normalize_text(text: str) -> str:
+        """Optionally strip diacritics, then retain only alphanumeric characters and casefold."""
+        if ignore_diacritics:
+            text = strip_diacritics(text)
+        return ''.join(ch for ch in text if ch.isalnum()).casefold()
+
+    normalized_main = normalize_text(main_string)
+    normalized_sub = normalize_text(subtext)
+
+    match_index = normalized_main.find(normalized_sub)
+    if match_index == -1:
+        return None  # No match found
+
+    # Map back to original indices in main_string
+    clean_index = 0
+    start_idx, end_idx = None, None
+
+    for i, ch in enumerate(main_string):
+        if ch.isalnum():
+            if clean_index == match_index and start_idx is None:
+                start_idx = i
+            if clean_index == match_index + len(normalized_sub) - 1:
+                end_idx = i
+                break
+            clean_index += 1
+
+    if start_idx is not None and end_idx is not None:
+        return (start_idx + 1, end_idx + 1)
+    return None
+
+# usage
+# # English
+# print(find_fuzzy_match_indices("Hello, how are you doing, all good?", "Hello How are you"))
+# # ➜ (1, 18)
+
+# # Mandarin Chinese
+# print(find_fuzzy_match_indices("你好，世界！今天你好吗？", "你好世界"))
+# # ➜ (1, 5)
+
+# # Arabic (without diacritics)
+# print(find_fuzzy_match_indices("مرحبا، كيف حالك؟", "مرحبا كيف حالك"))
+# # ➜ (1, 14)
+
+# # Arabic (with diacritics)
+# print(find_fuzzy_match_indices("مَرْحَبًا، كَيْفَ حَالُكَ؟", "مرحبا كيف حالك"))
+# # ➜ (1, 17)
+
+# ----------------------------------------------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------------------------------------------
+
+# use this section, the function normalize_long_repetitions only if you think it's necessary to remove consecutive duplicate words or
+# phrases present in any text from whisper. Such as "Thank you Thank you Thank you" or "okay okay okay" etc.
+# With proper chunk_len_s and stride_len_s parameters this won't occur much, hence its not always required. But good to have the code ready for use.
+
+import unicodedata
+
+def strip_diacritics(text: str) -> str:
+    return ''.join(
+        ch for ch in unicodedata.normalize('NFD', text)
+        if unicodedata.category(ch) != 'Mn'
+    )
+
+def normalize_text(token: str) -> str:
+    token = strip_diacritics(token)
+    token = ''.join(ch for ch in token if ch.isalnum())
+    return token.casefold()
+
+def is_cjk(ch: str) -> bool:
+    return any([
+        '\u4e00' <= ch <= '\u9fff',   # CJK Unified Ideographs
+        '\u3040' <= ch <= '\u309f',   # Hiragana
+        '\u30a0' <= ch <= '\u30ff',   # Katakana
+        '\uac00' <= ch <= '\ud7af'    # Hangul
+    ])
+
+def _collapse_repeats_seq(seq, norm_seq, min_single: int):
+    """
+    Generic collapse over a sequence (tokens or chars).
+    - Always collapse repeated multi-item phrases (period L > 1).
+    - Collapse single-item runs only if they repeat >= min_single.
+    Returns the collapsed sequence (preserving originals).
+    """
+    n = len(seq)
+    out = []
+    i = 0
+    while i < n:
+        # Find shortest repeating base period L (>=1) with at least 2 repeats.
+        chosen_L, repeats = None, 1
+        max_L = (n - i) // 2
+        for L in range(1, max_L + 1):
+            base = norm_seq[i:i+L]
+            if base and norm_seq[i+L:i+2*L] == base:
+                k = 2
+                while i + (k+1)*L <= n and norm_seq[i + k*L : i + (k+1)*L] == base:
+                    k += 1
+                chosen_L, repeats = L, k
+                break  # shortest L found
+
+        if chosen_L is None:
+            # No repetition starting at i
+            out.append(seq[i])
+            i += 1
+            continue
+
+        if chosen_L == 1:
+            # Single-item run
+            out.append(seq[i])  # always keep one
+            i += repeats if repeats >= min_single else 1
+        else:
+            # Multi-item phrase: keep one phrase, skip the rest
+            out.extend(seq[i:i+chosen_L])
+            i += chosen_L * repeats
+
+    return out
+
+def normalize_long_repetitions(text: str, min_word: int = 3, min_chars: int = 2) -> str:
+    """
+    Space-separated languages: collapse repeated multi-word phrases always;
+      collapse single-word runs only if >= min_word.
+    CJK (no spaces): collapse repeated multi-character phrases always;
+      collapse single-character runs only if >= min_chars.
+    Comparison ignores case/punctuation/diacritics; output preserves originals.
+    """
+    text = str(text).strip()
+    if not text:
+        return text
+
+    cjk_ratio = sum(is_cjk(ch) for ch in text) / max(1, len(text))
+    is_likely_cjk = cjk_ratio > 0.3 and ' ' not in text
+
+    if is_likely_cjk:
+        chars = list(text)
+        norm_chars = [normalize_text(c) for c in chars]
+        return ''.join(_collapse_repeats_seq(chars, norm_chars, min_chars))
+    else:
+        tokens = text.split()
+        if len(tokens) < 2:
+            return text
+        norm_tokens = [normalize_text(t) for t in tokens]
+        return ' '.join(_collapse_repeats_seq(tokens, norm_tokens, min_word))
+    
+# usage: 
+# Not mandatory, only if any string/text has many consecutive repeats of texts( words/phrases), then this is used to clean up a bit.
+# example: "I want to want to replace replace my credit card"  -----> "I want to replace my credit card"
+# normalize_long_repetitions(text)
+
+# ----------------------------------------------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------------------------------------------
+
+# In this section we are going to get the index/position of a matched text segment from any of the channels left or right
+# against the full segment's combined text
+
+from typing import List, Dict, Any, Optional
+import unicodedata
+
+# ---- helpers (Unicode-normalized search with precise index mapping) ----
+
+def _strip_diacritics(text: str) -> str:
+    return ''.join(ch for ch in unicodedata.normalize('NFD', text)
+                   if unicodedata.category(ch) != 'Mn')
+
+def _normalize_token_stream_char(ch: str) -> str:
+    """
+    Normalize a single original char into normalized emission:
+      - NFD
+      - drop combining marks
+      - keep only alnum
+      - casefold (may emit multiple code points, e.g. ß -> 'ss')
+    """
+    base = ''.join(c for c in unicodedata.normalize('NFD', ch)
+                   if unicodedata.category(c) != 'Mn')
+    out = []
+    for c in base:
+        if c.isalnum():
+            out.append(c.casefold())
+    return ''.join(out)
+
+def _normalize_text(s: str) -> str:
+    # for candidate strings (whole text), apply same normalization as stream
+    s = _strip_diacritics(s)
+    s = ''.join(ch for ch in s if ch.isalnum())
+    return s.casefold()
+
+def _build_norm_index(full_text: str):
+    """
+    Build normalized string and mapping arrays:
+      norm_str: concatenation of normalized emissions
+      norm_to_orig[i] -> original index of the i-th normalized char
+      orig_to_first_norm[k] -> first norm index at or after original index k
+    """
+    norm_chars = []
+    norm_to_orig = []
+    orig_to_first_norm = [None] * (len(full_text) + 1)  # +1 sentinel
+
+    for i, ch in enumerate(full_text):
+        emit = _normalize_token_stream_char(ch)
+        if emit:
+            start_norm = len(norm_chars)
+            norm_chars.extend(list(emit))
+            norm_to_orig.extend([i] * len(emit))
+            if orig_to_first_norm[i] is None:
+                orig_to_first_norm[i] = start_norm
+
+    # sentinel points to end of norm stream
+    orig_to_first_norm[-1] = len(norm_chars)
+
+    # fill forward missing slots with next known norm index
+    next_idx = orig_to_first_norm[-1]
+    for k in range(len(full_text), -1, -1):
+        if orig_to_first_norm[k] is None:
+            orig_to_first_norm[k] = next_idx
+        else:
+            next_idx = orig_to_first_norm[k]
+
+    return ''.join(norm_chars), norm_to_orig, orig_to_first_norm
+
+def _map_norm_span_to_orig(full_text: str,
+                           norm_to_orig: List[int],
+                           n_start: int, n_len: int) -> (int, int):
+    """
+    Map a normalized span [n_start, n_start+n_len) back to original [start_pos, end_pos)
+    and extend end_pos over any trailing combining marks.
+    """
+    if n_len <= 0:
+        return -1, -1
+    n_end_incl = n_start + n_len - 1
+    if n_start < 0 or n_end_incl >= len(norm_to_orig):
+        return -1, -1
+    orig_start = norm_to_orig[n_start]
+    last_base = norm_to_orig[n_end_incl]
+    end_excl = last_base + 1
+    # include trailing combining marks after last base
+    while end_excl < len(full_text) and unicodedata.category(full_text[end_excl]) == 'Mn':
+        end_excl += 1
+    return orig_start, end_excl
+
+# ---- your original combine helper (unchanged semantics) ----
+def combine_channel_text(full_channel: List[Dict[str, Any]]) -> str:
+    return " ".join(item.get("text", "") for item in full_channel if isinstance(item, dict)).strip()
+
+# ---- FIXED: forward-search, diacritic/punct/space-insensitive, with exact indices ----
+def add_global_pos_index(full_channel: List[Dict[str, Any]],
+                         channel_segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    For each entry in channel_segments, set start_pos/end_pos relative to the *combined* full_text,
+    searching from the last matched end forward (so repeated words like 'Perfect' map to
+    their correct later occurrence). Matching ignores case, spaces, punctuation, and diacritics,
+    and works across all languages (Latin/Arabic/Devanagari/CJK/etc.).
+
+    If not found in the remaining window, leaves (-1, -1) and does not advance the cursor.
+    """
+    full_text = combine_channel_text(full_channel)
+    norm_full, norm_to_orig, orig_to_first_norm = _build_norm_index(full_text)
+
+    # moving cursor in *original* index space (we convert to normalized via orig_to_first_norm)
+    cursor_orig = 0
+    out: List[Dict[str, Any]] = []
+
+    for entry in channel_segments:
+        text = entry.get('text', '') or ''
+        cand_norm = _normalize_text(text)
+
+        start_pos, end_pos = -1, -1
+        if cand_norm:
+            # compute normalized window [n_start, n_end)
+            n_start = orig_to_first_norm[min(max(0, cursor_orig), len(full_text))]
+            n_end   = orig_to_first_norm[len(full_text)]  # end of norm stream
+
+            # search only in the *remaining* normalized suffix
+            rel = norm_full.find(cand_norm, n_start, n_end)
+            if rel != -1:
+                s, e = _map_norm_span_to_orig(full_text, norm_to_orig, rel, len(cand_norm))
+                start_pos, end_pos = s, e
+                # advance cursor to end of the matched original span
+                if e != -1:
+                    cursor_orig = max(cursor_orig, e)
+
+        # write results without mutating caller's dict
+        new_entry = dict(entry)
+        new_entry['start_pos'] = start_pos
+        new_entry['end_pos'] = end_pos
+        out.append(new_entry)
+
+    return out
+
+# usage
+# left_channel_2 = add_global_pos_index(full_channel, left_channel)
+# right_channel_2 = add_global_pos_index(full_channel, right_channel)
+
+# ----------------------------------------------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------------------------------------------
+
+from typing import List, Dict, Any, Optional
+import unicodedata
+
+# ---------- Normalization & Mapping Helpers (Unicode-, diacritic-, punct-/space-insensitive) ----------
+
+def strip_diacritics(text: str) -> str:
+    return ''.join(
+        ch for ch in unicodedata.normalize('NFD', text)
+        if unicodedata.category(ch) != 'Mn'
+    )
+
+def _normalize_char_emit(ch: str) -> str:
+    """
+    Normalize a single *base* character into the normalized alphabetic/digit output:
+      - Decompose -> strip diacritics
+      - keep only alnum
+      - casefold (note: may emit multiple code points, e.g. ß -> 'ss')
+    Return the normalized emission (possibly '' if non-alnum).
+    """
+    # strip diacritics for this single char
+    base = ''.join(c for c in unicodedata.normalize('NFD', ch) if unicodedata.category(c) != 'Mn')
+    out = []
+    for c in base:
+        if c.isalnum():
+            out.append(c.casefold())
+    return ''.join(out)
+
+def build_normalized_index(full_text: str):
+    """
+    Build a normalized string for full_text (diacritics/space/punct ignored, casefolded)
+    and a precise mapping from each normalized char position to the original full_text index.
+
+    Returns:
+      norm_str: str
+      norm_to_orig: List[int]  # len == len(norm_str); norm_to_orig[i] = original index of this normalized char
+      orig_to_next_norm: List[Optional[int]]  # for each original index k, the smallest norm idx >= mapping from k onwards (or None)
+    """
+    norm_chars: List[str] = []
+    norm_to_orig: List[int] = []
+
+    # for every original index, record the first normalized index >= this orig position
+    orig_to_first_norm: List[Optional[int]] = [None] * (len(full_text) + 1)  # include sentinel at end
+
+    for i, ch in enumerate(full_text):
+        emit = _normalize_char_emit(ch)
+        if emit:
+            start_norm_idx = len(norm_chars)
+            norm_chars.extend(list(emit))
+            norm_to_orig.extend([i] * len(emit))
+            # if this original index hasn't mapped yet, set it to current norm idx
+            if orig_to_first_norm[i] is None:
+                orig_to_first_norm[i] = start_norm_idx
+        # if this original index produced nothing, leave None; we'll fill forward below
+
+    # sentinel at end maps to len(norm_chars)
+    orig_to_first_norm[-1] = len(norm_chars)
+
+    # fill forward: for any None at position k, take the next non-None to the right
+    next_idx = orig_to_first_norm[-1]
+    for k in range(len(full_text), -1, -1):
+        if orig_to_first_norm[k] is None:
+            orig_to_first_norm[k] = next_idx
+        else:
+            next_idx = orig_to_first_norm[k]
+
+    norm_str = ''.join(norm_chars)
+    # orig_to_next_norm[k] is the first normalized index at or after original position k
+    orig_to_next_norm = orig_to_first_norm
+    return norm_str, norm_to_orig, orig_to_next_norm
+
+# def normalize_text(text: str) -> str:
+#     # full normalization for candidate segments (diacritics removed, non-alnum dropped, casefolded)
+#     text = strip_diacritics(text)
+#     text = ''.join(ch for ch in text if ch.isalnum())
+#     return text.casefold()
+
+def map_norm_match_to_orig_bounds(full_text: str,
+                                  norm_to_orig: List[int],
+                                  n_start: int,
+                                  n_len: int) -> (int, int):
+    """
+    Given a match at normalized indices [n_start, n_start+n_len),
+    return precise original [start_pos, end_pos) indices.
+
+    end_pos is exclusive. We also extend end_pos to include any trailing combining marks ('Mn')
+    immediately following the last matched base character.
+    """
+    if n_len <= 0:
+        return -1, -1
+    n_end_inclusive = n_start + n_len - 1
+    if n_start < 0 or n_end_inclusive >= len(norm_to_orig):
+        return -1, -1
+
+    orig_start = norm_to_orig[n_start]
+    last_base_idx = norm_to_orig[n_end_inclusive]
+
+    # include any trailing combining marks after the last base char
+    end_exclusive = last_base_idx + 1
+    while end_exclusive < len(full_text) and unicodedata.category(full_text[end_exclusive]) == 'Mn':
+        end_exclusive += 1
+
+    return orig_start, end_exclusive
+
+def combine_channel_text(full_channel: List[Dict[str, Any]]) -> str:
+    return " ".join(item.get("text", "") for item in full_channel if isinstance(item, dict)).strip()
+
+
+# ---------------------------------- Fixed expand_missing_segments ----------------------------------
+
+def expand_missing_segments(
+    full_channel: List[Dict[str, Any]],
+    segments: List[Dict[str, Any]],
+    min_words: int = 2,
+) -> List[Dict[str, Any]]:
+    """
+    Replace any segment with start_pos==-1 by fragments found sequentially
+    in full_text using approximate normalized matching (case/space/punct/diacritics-insensitive).
+
+    Core search strategy unchanged:
+      - For each missing segment, within [prev_end, next_known_start) window,
+        greedily pick the longest subsequence of words that exists in order.
+      - If no ≥min_words subsequence matches at i, skip one word and retry.
+
+    Fixes:
+      - Build a precise normalized index over full_text and map matches back to exact [start_pos, end_pos).
+      - Every split fragment inherits parent's metadata (incl. 'channel'); missing timing keys default to -1.
+    """
+    full_text = combine_channel_text(full_channel)
+
+    # Build precise normalized index and mappings for full_text
+    norm_full, norm_to_orig, orig_to_next_norm = build_normalized_index(full_text)
+
+    # Infer a channel hint if some segments lack 'channel'
+    channel_hint: Optional[str] = next((s.get("channel") for s in segments if isinstance(s.get("channel"), str) and s["channel"]), None)
+
+    def next_known_start_from_input(idx: int) -> Optional[int]:
+        for k in range(idx + 1, len(segments)):
+            st = segments[k].get("start_pos", -1)
+            if isinstance(st, int) and st != -1:
+                return st
+        return None
+
+    def last_known_end_from_output(out: List[Dict[str, Any]]) -> int:
+        for k in range(len(out) - 1, -1, -1):
+            item = out[k]
+            if isinstance(item, dict) and isinstance(item.get("end_pos", None), int) and item["end_pos"] != -1:
+                return item["end_pos"]
+        return 0
+
+    def _clone_fragment(base: Dict[str, Any], *, text: str, start_idx: int, end_idx: int) -> Dict[str, Any]:
+        frag = dict(base)  # inherit all metadata incl. 'channel'
+        frag["text"] = text
+        frag["start_pos"] = start_idx
+        frag["end_pos"] = end_idx
+        for k in ("start_time", "end_time", "start_time_full", "end_time_full"):
+            if k not in frag or frag[k] is None:
+                frag[k] = -1
+        if ("channel" not in frag or not frag["channel"]) and channel_hint:
+            frag["channel"] = channel_hint
+        return frag
+
+    def find_in_window(candidate: str, window_start_orig: int, window_end_orig: Optional[int]) -> (int, int):
+        """
+        Find candidate (normalized) inside normalized full_text but constrained to original window.
+        Returns (start_pos, end_pos) in original full_text, or (-1, -1) if not found.
+        """
+        cand_norm = normalize_text(candidate)
+        if not cand_norm:
+            return -1, -1
+
+        # map original window -> normalized window
+        n_start = orig_to_next_norm[min(max(0, window_start_orig), len(full_text))]
+        if window_end_orig is None:
+            n_end = len(norm_full)
+        else:
+            n_end = orig_to_next_norm[min(max(0, window_end_orig), len(full_text))]
+
+        if n_start is None or n_start >= n_end:
+            return -1, -1
+
+        rel = norm_full.find(cand_norm, n_start, n_end)
+        if rel == -1:
+            return -1, -1
+
+        start_pos, end_pos = map_norm_match_to_orig_bounds(full_text, norm_to_orig, rel, len(cand_norm))
+        return start_pos, end_pos
+
+    def match_fragments_in_window(base_seg: Dict[str, Any], text: str, window_start: int, window_end: Optional[int]) -> List[Dict[str, Any]]:
+        words = text.split()
+        i = 0
+        frags: List[Dict[str, Any]] = []
+        search_pos = window_start
+
+        while i < len(words):
+            found_any = False
+            # try longest -> shortest subsequence of words[i:]
+            for j in range(len(words), i + min_words - 1, -1):
+                candidate = " ".join(words[i:j])
+                s_pos, e_pos = find_in_window(candidate, search_pos, window_end)
+                if s_pos != -1:
+                    frags.append(_clone_fragment(base_seg, text=candidate, start_idx=s_pos, end_idx=e_pos))
+                    search_pos = e_pos  # advance by exact original end (exclusive)
+                    i = j
+                    found_any = True
+                    break
+            if not found_any:
+                i += 1
+
+        return frags
+
+    output: List[Dict[str, Any]] = []
+    for i, seg in enumerate(segments):
+        # ensure top-level segment has channel/timing keys
+        if ("channel" not in seg or not seg.get("channel")) and channel_hint:
+            seg = {**seg, "channel": channel_hint}
+        for k in ("start_time", "end_time", "start_time_full", "end_time_full"):
+            if k not in seg or seg[k] is None:
+                seg[k] = -1
+
+        st = seg.get("start_pos", -1)
+        if isinstance(st, int) and st != -1:
+            output.append(seg)
+            continue
+
+        prev_end = last_known_end_from_output(output)
+        next_start = next_known_start_from_input(i)
+
+        frags = match_fragments_in_window(seg, seg.get("text", "") or "", prev_end, next_start)
+        if frags:
+            output.extend(frags)
+        else:
+            # keep unresolved, with consistent keys
+            output.append(seg)
+
+    return output
+
+# usage
+# left_channel_3 = expand_missing_segments(
+#     full_channel,
+#     left_channel_2
+# )
+
+# right_channel_3 = expand_missing_segments(
+#     full_channel,
+#     right_channel_2
+# )
+
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------------------------------------------
+
+# In this section we are finding the start_time_full and end_time_full timestamps from the full segments against a match
+# found in any of the channel's segments in the full_text
+
+def combine_channel_text_with_map(full_channel: List[Dict[str, Any]]):
+    """
+    Combine texts while keeping mapping of character indices → (start_time, end_time).
+    Returns: full_text, position_map (list of dicts)
+    """
+    full_text = ""
+    mapping = []
+    cursor = 0
+    for item in full_channel:
+        text = item.get("text", "")
+        if not isinstance(text, str):
+            continue
+        start_time = item.get("start_time", None)
+        end_time = item.get("end_time", None)
+        start_idx = cursor
+        full_text += text
+        end_idx = start_idx + len(text)
+        mapping.append({
+            "start_idx": start_idx,
+            "end_idx": end_idx,
+            "start_time": start_time,
+            "end_time": end_time
+        })
+        cursor = end_idx + 1  # +1 for space separator
+        full_text += " "
+    return full_text.strip(), mapping
+
+def attach_full_times(expanded_segments: List[Dict[str, Any]], mapping: List[Dict[str, Any]]):
+    """
+    Attach start_time_full and end_time_full based on char position mapping.
+
+    - Always includes keys in every segment.
+    - If no match or cannot infer mapping, sets both values to -1.
+    """
+    for seg in expanded_segments:
+        start_pos = seg.get("start_pos", -1)
+        end_pos = seg.get("end_pos", -1)
+
+        # Default values (no match)
+        seg["start_time_full"] = -1
+        seg["end_time_full"] = -1
+
+        if not isinstance(start_pos, int) or not isinstance(end_pos, int) or start_pos == -1 or end_pos == -1:
+            continue  # keep -1, -1 if invalid or unresolved
+
+        start_time_full, end_time_full = None, None
+
+        for m in mapping:
+            # Find where start_pos falls
+            if m["start_idx"] <= start_pos < m["end_idx"]:
+                start_time_full = m["start_time"]
+            # Find where end_pos falls
+            if m["start_idx"] < end_pos <= m["end_idx"]:
+                end_time_full = m["end_time"]
+
+        # If match spans across multiple items, fill from first and last
+        if start_time_full is None:
+            for m in mapping:
+                if start_pos < m["end_idx"]:
+                    start_time_full = m["start_time"]
+                    break
+
+        if end_time_full is None:
+            for m in reversed(mapping):
+                if end_pos > m["start_idx"]:
+                    end_time_full = m["end_time"]
+                    break
+
+        # Final fallback if still None (unresolvable)
+        seg["start_time_full"] = start_time_full if start_time_full is not None else -1
+        seg["end_time_full"] = end_time_full if end_time_full is not None else -1
+
+    return expanded_segments
+
+# usage
+
+# full_text, time_map = combine_channel_text_with_map(full_channel)
+
+# left_channel_4 = attach_full_times(left_channel_3, time_map)
+# right_channel_4 = attach_full_times(right_channel_3, time_map)
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------------------------------------------
+
+# Final part of merging the text segments from both channels and sorting them based on a global sequnce nuber starting 
+# from 1.
+
+
+from typing import List, Dict, Any
+
+def merge_and_sort_transcripts(
+    left_channel: List[Dict[str, Any]],
+    right_channel: List[Dict[str, Any]],
+    left_channel_speaker: str = "Agent",
+    right_channel_speaker: str = "Customer"
+) -> List[Dict[str, Any]]:
+    """
+    Merge left/right channel transcription lists into a single ordered conversation.
+    Sorting priority:
+      1. start_pos (if available)
+      2. start_time_full (or midpoint of full-time range)
+      3. start_time (or midpoint of channel-time range)
+    Each output item includes:
+      - sequence (1..N)
+      - speaker (based on channel)
+    """
+
+    merged = []
+    for entry in left_channel + right_channel:
+        e = dict(entry)  # shallow copy to avoid mutating input
+
+        # --- Ensure required numeric fields exist ---
+        for k in ["start_pos", "end_pos", "start_time_full", "end_time_full", "start_time", "end_time"]:
+            e[k] = e.get(k, -1)
+            if e[k] is None:
+                e[k] = -1
+
+        # --- Compute fallback ordering scores ---
+        # Position score: valid values prioritized
+        pos_score = e["start_pos"] if e["start_pos"] != -1 else float("inf")
+
+        # Full-channel time score (fallback 1)
+        if e["start_time_full"] != -1 and e["end_time_full"] != -1:
+            full_score = (e["start_time_full"] + e["end_time_full"]) / 2
+        else:
+            full_score = float("inf")
+
+        # Channel-level time score (fallback 2)
+        if e["start_time"] != -1 and e["end_time"] != -1:
+            chan_score = (e["start_time"] + e["end_time"]) / 2
+        else:
+            chan_score = float("inf")
+
+        e["_sort_key"] = (pos_score, full_score, chan_score)
+
+        merged.append(e)
+
+    # --- Sort using composite key ---
+    merged.sort(key=lambda x: x["_sort_key"])
+
+    # --- Add sequence and speaker info ---
+    for i, item in enumerate(merged, start=1):
+        item["sequence"] = i
+
+        ch = item.get("channel", "").lower()
+        if ch == "left":
+            item["speaker"] = left_channel_speaker
+        elif ch == "right":
+            item["speaker"] = right_channel_speaker
+        else:
+            item["speaker"] = "Unknown"
+
+        # remove internal sort key
+        item.pop("_sort_key", None)
+
+    return merged
+
+# usage
+# merged_conv = merge_and_sort_transcripts(
+#     left_channel_4, 
+#     right_channel_4,
+#     left_channel_speaker="Agent",
+#     right_channel_speaker="Customer"
+# )
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------------------------------------------
+
+# After the merging and sorting in the previous step some entries still has -1 as those texts were not found in the full_channel
+# But those were found with timesegments in either left/ right channels.
+# Ignoring and removing those might incur the loss of significantly meaningful chunk of information, hence we will reposition those 
+# segments in between any two of the earlier text chunks based on their timestamps.
+# Generally if the audio has many speaker overlaps across channels, this situation could occur.
+
+from typing import List, Dict, Any
+
+def reorder_and_resequence(
+    merged_segments: List[Dict[str, Any]],
+    left_channel_speaker: str = "Agent",
+    right_channel_speaker: str = "Customer",
+) -> List[Dict[str, Any]]:
+    """
+    Reorders conversation segments intelligently:
+      - Segments with valid start_pos are first sorted by start_pos.
+      - Segments with -1 start_pos are inserted by their available timing
+        (start_time_full if valid, else start_time), between nearest neighbors.
+      - After merging, sequence ids are reassigned from 1..N.
+      - Output dicts have ordered keys:
+          sequence, channel, speaker, text,
+          start_pos, end_pos, start_time, end_time, start_time_full, end_time_full
+    """
+
+    def time_score(entry: Dict[str, Any]) -> float:
+        """Pick the best time for sorting unmatched entries."""
+        for key in ("start_time_full", "start_time", "end_time_full", "end_time"):
+            val = entry.get(key, -1)
+            if isinstance(val, (int, float)) and val >= 0:
+                return val
+        return float("inf")
+
+    # --- Step 1: Split into matched and unmatched ---
+    matched = [e for e in merged_segments if e.get("start_pos", -1) != -1]
+    unmatched = [e for e in merged_segments if e.get("start_pos", -1) == -1]
+
+    # --- Step 2: Sort matched entries by start_pos ---
+    matched.sort(key=lambda e: e.get("start_pos", float("inf")))
+
+    # --- Step 3: Iteratively insert unmatched entries ---
+    for um in sorted(unmatched, key=time_score):
+        um_time = time_score(um)
+        inserted = False
+
+        # find position where it fits chronologically by time
+        for i in range(len(matched) - 1):
+            left = matched[i]
+            right = matched[i + 1]
+
+            # pick mid time for smoother placement
+            left_t = time_score(left)
+            right_t = time_score(right)
+
+            if left_t <= um_time <= right_t:
+                matched.insert(i + 1, um)
+                inserted = True
+                break
+
+        if not inserted:
+            # if its time is earlier than all → prepend
+            first_time = time_score(matched[0]) if matched else float("inf")
+            last_time = time_score(matched[-1]) if matched else float("-inf")
+            if um_time < first_time:
+                matched.insert(0, um)
+            elif um_time >= last_time:
+                matched.append(um)
+            else:
+                matched.append(um)
+
+    # --- Step 4: Reassign sequence and speaker, enforce key order ---
+    output = []
+    for seq, e in enumerate(matched, start=1):
+        ch = e.get("channel", "").lower()
+        speaker = (
+            left_channel_speaker if ch == "left"
+            else right_channel_speaker if ch == "right"
+            else "Unknown"
+        )
+
+        ordered_dict = {
+            "sequence": seq,
+            "channel": e.get("channel", ""),
+            "speaker": speaker,
+            "text": e.get("text", ""),
+            "start_pos": e.get("start_pos", -1),
+            "end_pos": e.get("end_pos", -1),
+            "start_time": e.get("start_time", -1),
+            "end_time": e.get("end_time", -1),
+            "start_time_full": e.get("start_time_full", -1),
+            "end_time_full": e.get("end_time_full", -1),
+        }
+        output.append(ordered_dict)
+
+    return output
+
+# Usage
+# final_merged_conv = reorder_and_resequence(
+#     merged_conv,
+#     left_channel_speaker="Agent",
+#     right_channel_speaker="Customer"
+# )
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------------------------------------------
+
+# The final step to smooth out dialogs and reduce number of sequences.
+# If any two or more consecutive sequence thus far until previous step contains the same speaker, then this function will
+# merge them into a single chunk of text and resequence. So that "Hello sir my name is Amit" and "how may I help you today" are
+# merged to a single text as "Hello sir my name is Amit how may I help you today" and only one sequence id is generanted against 
+# the whole text.
+
+from typing import List, Dict, Any
+
+def merge_consecutive_speaker_segments(conversation: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Merge consecutive entries from the same speaker into one.
+    
+    Rules:
+      - Merge consecutive rows with identical speaker value.
+      - Merged text is concatenated with a space in between.
+      - start_time / start_pos / start_time_full come from the first segment.
+      - end_time / end_pos / end_time_full come from the last segment.
+      - channel is inherited (if same speaker uses same channel).
+      - Reassign sequence numbers after merging.
+      - Output preserves key order:
+          sequence, channel, speaker, text,
+          start_pos, end_pos, start_time, end_time,
+          start_time_full, end_time_full
+    """
+
+    if not conversation:
+        return []
+
+    merged = []
+    buffer = [conversation[0]]
+
+    def flush_buffer(buf):
+        """Merge all items in the buffer into one entry."""
+        if not buf:
+            return None
+        first = buf[0]
+        last = buf[-1]
+        merged_text = " ".join(item.get("text", "").strip() for item in buf if item.get("text"))
+
+        merged_entry = {
+            "sequence": 0,  # temporary, will reassign later
+            "channel": first.get("channel", ""),
+            "speaker": first.get("speaker", ""),
+            "text": merged_text.strip(),
+            "start_pos": first.get("start_pos", -1),
+            "end_pos": last.get("end_pos", -1),
+            "start_time": first.get("start_time", -1),
+            "end_time": last.get("end_time", -1),
+            "start_time_full": first.get("start_time_full", -1),
+            "end_time_full": last.get("end_time_full", -1),
+        }
+        return merged_entry
+
+    for current in conversation[1:]:
+        prev = buffer[-1]
+        # Merge if same speaker (and same channel ideally)
+        if current.get("speaker") == prev.get("speaker"):
+            buffer.append(current)
+        else:
+            merged.append(flush_buffer(buffer))
+            buffer = [current]
+
+    # Flush remaining
+    if buffer:
+        merged.append(flush_buffer(buffer))
+
+    # Reassign sequence numbers in order
+    for i, entry in enumerate(merged, start=1):
+        entry["sequence"] = i
+
+    return merged
+
+# usage
+# final_smoothed_conv = merge_consecutive_speaker_segments(final_merged_conv)
