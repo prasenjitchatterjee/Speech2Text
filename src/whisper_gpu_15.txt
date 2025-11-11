@@ -1,0 +1,290 @@
+import warnings
+warnings.filterwarnings("ignore")
+import time
+import os
+import gc
+import traceback
+import json
+from datetime import datetime
+from typing import List
+from concurrent.futures import ThreadPoolExecutor
+import difflib
+import re
+
+import torch
+from transformers import pipeline, AutoTokenizer
+from pydub import AudioSegment
+from fastapi import FastAPI, Body
+import numpy as np
+import librosa
+
+from process_transcripts import *
+
+app = FastAPI()
+
+# -------------------
+# Load Whisper Config
+# -------------------
+try:
+    with open("whisper_config.json", "r") as f:
+        config_data = json.load(f)
+
+    model_path = config_data["whisper"]["model"]
+    batch_size = config_data["whisper"]["batch_size"]
+    sample_rate = config_data["whisper"]["sample_rate"]
+    return_diagnostics = config_data["whisper"]["return_diagnostics"]
+    file_corruption_check = config_data["whisper"]["file_corruption_check"]
+    right_channel_speaker = config_data["whisper"]["right_channel_speaker"]
+    left_channel_speaker = config_data["whisper"]["left_channel_speaker"]
+except Exception as ex:
+    print("Error reading config, using defaults:", ex)
+    model_path = "models/whisper-large-v3-turbo"
+    batch_size = 16
+    sample_rate = 16000
+    return_diagnostics = 1
+    file_corruption_check = 1
+    right_channel_speaker = "Customer"
+    left_channel_speaker = "Agent"
+
+num_gpus = torch.cuda.device_count()
+device_list = [f"cuda:{i}" for i in range(num_gpus)] if num_gpus > 0 else ["cpu"]
+print(f"Available devices: {device_list}")
+
+tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+
+# -------------------
+# Helper Functions
+# -------------------
+def check_audio_corruption_load(filepath):
+    import wave
+    try:
+        with wave.open(filepath, "rb") as wav_file:
+            _ = wav_file.getparams()
+        return False
+    except Exception as e:
+        print(f"Corruption detected in {filepath}: {e}")
+        return True
+
+
+def extract_stereo_channels(file_path):
+    audio = AudioSegment.from_file(file_path)
+    samples = np.array(audio.get_array_of_samples())
+    if audio.channels == 2:
+        left = samples[::2]
+        right = samples[1::2]
+    else:
+        left = samples
+        right = samples
+    left = left.astype(np.float32) / (2 ** 15)
+    right = right.astype(np.float32) / (2 ** 15)
+    return {"left": left, "right": right, "frame_rate": audio.frame_rate}
+
+
+def extract_full_mono(file_path):
+    audio = AudioSegment.from_file(file_path).set_channels(1)
+    samples = np.array(audio.get_array_of_samples())
+    mono = samples.astype(np.float32) / (2 ** 15)
+    return mono, audio.frame_rate
+
+
+def resample_if_needed(audio_array, sr, target_sr=16000):
+    if sr != target_sr:
+        audio_array = librosa.resample(audio_array, orig_sr=sr, target_sr=target_sr)
+        sr = target_sr
+    return audio_array, sr
+
+
+def get_duration_pydub(file_path: str) -> float:
+    audio = AudioSegment.from_file(file_path)
+    return len(audio) / 1000.0
+
+
+def get_full_stacktrace(e: Exception) -> str:
+    exc_part = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+    stack_part = "".join(traceback.format_stack())
+    return "=== Exception Traceback ===\n" + exc_part + "\n=== Full Current Stack ===\n" + stack_part
+
+
+# -------------------
+# Create Whisper Pipeline
+# -------------------
+def create_pipelines(model_id, num_devices):
+    print(f"Creating Whisper pipelines for {num_devices} devices...")
+    assert num_devices > 0, "No GPUs/CPU devices found"
+    return [
+        pipeline(
+            "automatic-speech-recognition",
+            model=model_id,
+            tokenizer=tokenizer,
+            device=i,
+            return_timestamps=True,
+        )
+        for i in range(num_devices)
+    ]
+
+
+# -------------------
+# Transcription Function
+# -------------------
+def transcribe(pipe, audio_data_list, chunk_length_s=30, stride_length_s=5):
+    results = []
+    for item in audio_data_list:
+        audio_array, sr, channel_name, audio_name = (
+            item["audio"],
+            item["sr"],
+            item["channel"],
+            item["audio_file"],
+        )
+        try:
+            audio_array, sr = resample_if_needed(audio_array, sr)
+            result = pipe(
+                {"array": audio_array, "sampling_rate": sr},
+                chunk_length_s=chunk_length_s,
+                stride_length_s=stride_length_s,
+            )
+
+            segments = []
+            if "chunks" in result:
+                for seg in result["chunks"]:
+                    ts = seg.get("timestamp", None)
+                    if isinstance(ts, list) and len(ts) >= 2:
+                        start_val, end_val = ts
+                    else:
+                        start_val = end_val = 0.0
+                    start_t = round(start_val or 0, 2)
+                    end_t = round(end_val or start_val, 2)
+                    text = (seg.get("text") or "").strip()
+                    if not text:
+                        continue
+                    segments.append(
+                        {
+                            "channel": channel_name,
+                            "start_time": start_t,
+                            "end_time": end_t,
+                            "timestamps": f"{start_t}-{end_t}",
+                            "text": text,
+                        }
+                    )
+
+            results.append({"audio_file": audio_name, "segments": segments})
+        except Exception as e:
+            print(f"Error transcribing {audio_name}-{channel_name}: {e}")
+            results.append({"audio_file": audio_name, "segments": []})
+    return results
+
+
+# -------------------
+# Main Endpoint (core flow preserved)
+# -------------------
+@app.post("/transcribe/")
+async def do_transcribe(files: List[str] = Body(...)):
+    try:
+        file_paths = [{"audio_file": os.path.basename(fp), "audio": fp} for fp in files]
+        path_map = {os.path.basename(fp): fp for fp in files}
+
+        corrupted_files = []
+        if file_corruption_check:
+            print("Checking file corruption...")
+            file_corruption_status = [
+                check_audio_corruption_load(fp["audio"]) for fp in file_paths
+            ]
+            valid_files = [
+                file_paths[i]
+                for i in range(len(file_paths))
+                if not file_corruption_status[i]
+            ]
+            corrupted_files = [
+                fp["audio"]
+                for i, fp in enumerate(file_paths)
+                if file_corruption_status[i]
+            ]
+            file_paths = valid_files
+
+        if not file_paths:
+            return {"error": "No valid audio files found", "corrupted_files": corrupted_files}
+
+        # Prepare left, right, and full mono
+        audio_splits = []
+        for entry in file_paths:
+            audio_name = entry["audio_file"]
+            channels = extract_stereo_channels(entry["audio"])
+            mono_array, mono_sr = extract_full_mono(entry["audio"])
+            for ch_name, ch_data in {"left": channels["left"], "right": channels["right"]}.items():
+                audio_splits.append({
+                    "audio_file": audio_name,
+                    "channel": ch_name,
+                    "audio": ch_data,
+                    "sr": channels["frame_rate"]
+                })
+            audio_splits.append({
+                "audio_file": audio_name,
+                "channel": "full",
+                "audio": mono_array,
+                "sr": mono_sr
+            })
+
+        total_duration = sum(get_duration_pydub(entry["audio"]) for entry in file_paths)
+
+        num_workers = min(num_gpus or 1, len(audio_splits))
+        pipes = create_pipelines(model_path, num_workers)
+        splits = [[] for _ in range(num_workers)]
+        for i, item in enumerate(audio_splits):
+            splits[i % num_workers].append(item)
+
+        start = time.time()
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            results = list(executor.map(transcribe, pipes, splits))
+        end = time.time()
+
+        transcription_time = end - start
+        efficiency = total_duration / transcription_time if transcription_time > 0 else 0
+
+        # Merge GPU results into per-file
+        merged = {}
+        for gpu_result in results:
+            for item in gpu_result:
+                af = item["audio_file"]
+                merged.setdefault(af, []).extend(item["segments"])
+
+        final_output = []
+        for audio_file, segs in merged.items():
+            full_segs = [s for s in segs if s["channel"] == "full"]
+            left_segs = [s for s in segs if s["channel"] == "left"]
+            right_segs = [s for s in segs if s["channel"] == "right"]
+
+            dialog_output = merge_by_full_reference(
+                audio_file=audio_file,
+                full_segs=full_segs,
+                left_segs=left_segs,
+                right_segs=right_segs,
+                left_channel_speaker=left_channel_speaker,
+                right_channel_speaker=right_channel_speaker,
+                file_total_duration=get_duration_pydub(path_map.get(audio_file, "")) if path_map.get(audio_file, "") else total_duration
+            )
+
+            # Only return required fields
+            for d in dialog_output:
+                d.pop("start_time", None)
+                d.pop("end_time", None)
+
+            final_output.append({"audio_file": audio_file, "info": dialog_output})
+
+        json_output = {
+            "total_audio_duration": str(round(total_duration, 2)),
+            "transcription_time": str(round(transcription_time, 2)),
+            "efficiency": str(round(efficiency, 2)),
+            "output": final_output,
+            "corrupted_files": corrupted_files,
+        }
+
+        gc.collect()
+        return json_output
+
+    except Exception as ex:
+        return {"error": get_full_stacktrace(ex)}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)
