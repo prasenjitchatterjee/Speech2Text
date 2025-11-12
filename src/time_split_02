@@ -1,0 +1,162 @@
+from typing import List, Dict, Any
+import unicodedata
+
+def attach_full_times_and_split_by_positions(
+    full_text: str,
+    mapping: List[Dict[str, Any]],
+    expanded_segments: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """
+    Accurate, multilingual-safe attachment of full-channel times with optional splitting.
+
+    For each segment with valid [start_pos, end_pos):
+      - Find all full_channel mapping rows overlapped by that span.
+      - If >1 mapping overlapped, split at mapping boundaries:
+          * Space-based languages: adjust split to nearest space (avoid cutting inside words).
+          * CJK languages: split exactly on boundary (no spaces).
+      - For each subspan, set start_time_full/end_time_full from the overlapped mapping row.
+      - Text for each subspan is sliced from full_text using the exact [sub_start, sub_end).
+
+    Segments with invalid positions (-1) are kept as-is with start_time_full/end_time_full = -1.
+
+    Returns a NEW list; inputs are not mutated.
+    """
+
+    def is_cjk(ch: str) -> bool:
+        return any([
+            '\u4e00' <= ch <= '\u9fff',   # CJK Unified Ideographs
+            '\u3040' <= ch <= '\u309f',   # Hiragana
+            '\u30a0' <= ch <= '\u30ff',   # Katakana
+            '\uac00' <= ch <= '\ud7af'    # Hangul
+        ])
+
+    def is_space_based_language(text: str) -> bool:
+        if not text:
+            return True
+        cjk_ratio = sum(is_cjk(ch) for ch in text) / max(1, len(text))
+        return not (cjk_ratio > 0.3 and " " not in text)
+
+    def overlapped_mappings(start_pos: int, end_pos: int) -> List[Dict[str, Any]]:
+        # Return mapping rows that intersect [start_pos, end_pos)
+        return [m for m in mapping if not (end_pos <= m["start_idx"] or start_pos >= m["end_idx"])]
+
+    def adjust_split_to_word_boundary(split_pos: int, seg_start: int, seg_end: int) -> int:
+        """
+        For space-based languages, avoid cutting inside a word:
+        - If either side is already at a space boundary, keep it.
+        - Otherwise, choose the nearest space to the left or right.
+        - If none found, leave split_pos unchanged (last resort).
+        """
+        if split_pos <= seg_start or split_pos >= seg_end:
+            return split_pos
+        left_char = full_text[split_pos - 1] if split_pos - 1 >= 0 else " "
+        right_char = full_text[split_pos] if split_pos < len(full_text) else " "
+        if left_char.isspace() or right_char.isspace():
+            return split_pos
+
+        # search nearest spaces
+        left_space = full_text.rfind(" ", seg_start, split_pos)
+        right_space = full_text.find(" ", split_pos, seg_end)
+        left_dist = split_pos - left_space if left_space != -1 else None
+        right_dist = right_space - split_pos if right_space != -1 else None
+
+        if left_dist is None and right_dist is None:
+            return split_pos
+        if left_dist is None:
+            return right_space
+        if right_dist is None:
+            return left_space
+        # choose closer; prefer right if equal (keeps earlier piece intact)
+        return right_space if right_dist <= left_dist else left_space
+
+    new_segments: List[Dict[str, Any]] = []
+
+    for seg in expanded_segments:
+        s = seg.get("start_pos", -1)
+        e = seg.get("end_pos", -1)
+        text = seg.get("text", "") or ""
+
+        # Default for unmatched/invalid spans: keep as-is, times = -1
+        if not isinstance(s, int) or not isinstance(e, int) or s == -1 or e == -1 or e <= s:
+            ns = dict(seg)
+            ns["start_time_full"] = -1
+            ns["end_time_full"] = -1
+            new_segments.append(ns)
+            continue
+
+        # Find mapping rows that overlap this exact [s, e)
+        ovs = overlapped_mappings(s, e)
+
+        if not ovs:
+            ns = dict(seg)
+            ns["start_time_full"] = -1
+            ns["end_time_full"] = -1
+            new_segments.append(ns)
+            continue
+
+        # If contained in a single mapping row → simple assign
+        if len(ovs) == 1:
+            m = ovs[0]
+            ns = dict(seg)
+            ns["start_time_full"] = m["start_time"]
+            ns["end_time_full"] = m["end_time"]
+            new_segments.append(ns)
+            continue
+
+        # Multiple mapping rows → split at their boundaries (then adjust for words if needed)
+        # Build ordered cut points within [s, e]; include s and e
+        cut_points = [s]
+        for m in ovs:
+            # Only consider mapping boundaries strictly inside (s, e)
+            if s < m["end_idx"] < e:
+                cut_points.append(m["end_idx"])
+        cut_points.append(e)
+        cut_points = sorted(set(cut_points))
+
+        space_based = is_space_based_language(text)
+
+        # Walk through consecutive [a, b) subspans
+        for i in range(len(cut_points) - 1):
+            a = cut_points[i]
+            b = cut_points[i + 1]
+
+            # Adjust boundary for word-based langs to avoid mid-word splits
+            if space_based:
+                # Only adjust internal boundaries (skip the very first/last)
+                if i > 0:
+                    a = adjust_split_to_word_boundary(a, s, e)
+                if i < len(cut_points) - 2:
+                    b = adjust_split_to_word_boundary(b, s, e)
+
+                # Ensure monotonic and non-empty after adjustment
+                a = max(a, cut_points[i-1] if i > 0 else s)
+                b = min(b, cut_points[i+1] if i < len(cut_points)-2 else e)
+
+            if b <= a:
+                continue  # skip empty or inverted spans
+
+            # Slice exact text from full_text using positions (no fabricated lengths)
+            sub_text = full_text[a:b]
+
+            # Determine which mapping row covers the majority of [a,b)
+            # (since [a,b) should fall entirely inside one mapping after we cut at boundaries,
+            # the first that overlaps is enough)
+            m_for_span = None
+            for m in ovs:
+                if not (b <= m["start_idx"] or a >= m["end_idx"]):
+                    m_for_span = m
+                    break
+
+            ns = dict(seg)
+            ns["text"] = sub_text.strip()
+            ns["start_pos"] = a
+            ns["end_pos"] = b
+            ns["start_time_full"] = m_for_span["start_time"] if m_for_span else -1
+            ns["end_time_full"] = m_for_span["end_time"] if m_for_span else -1
+            # keep channel's own times from seg
+            ns["start_time"] = seg.get("start_time", -1)
+            ns["end_time"] = seg.get("end_time", -1)
+
+            new_segments.append(ns)
+
+    return new_segments
