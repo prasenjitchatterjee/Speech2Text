@@ -1,0 +1,93 @@
+from typing import List, Dict, Any
+
+def attach_full_times_and_longest_split(
+    full_text: str,
+    mapping: List[Dict[str, Any]],
+    expanded_segments: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Assign start_time_full / end_time_full and optionally split segments
+    that overlap multiple full_channel spans. Uses longest contiguous matches
+    rather than per-word slicing.
+
+    - Never spills text across channels.
+    - Preserves each segment's original text (split only if needed).
+    - Produces correct start_pos / end_pos and aligned full timestamps.
+    """
+
+    def overlaps(a0: int, a1: int, b0: int, b1: int) -> bool:
+        return not (a1 <= b0 or a0 >= b1)
+
+    new_segments: List[Dict[str, Any]] = []
+
+    for seg in expanded_segments:
+        s = seg.get("start_pos", -1)
+        e = seg.get("end_pos", -1)
+        text = seg.get("text", "") or ""
+
+        # invalid positions → keep as-is
+        if not isinstance(s, int) or not isinstance(e, int) or s == -1 or e == -1 or e <= s:
+            ns = dict(seg)
+            ns["start_time_full"] = -1
+            ns["end_time_full"] = -1
+            new_segments.append(ns)
+            continue
+
+        # collect full segments that overlap [s, e)
+        overlapped = [m for m in mapping if overlaps(s, e, m["start_idx"], m["end_idx"])]
+
+        # --- single overlap → no split ---
+        if len(overlapped) <= 1:
+            if overlapped:
+                m = overlapped[0]
+                seg_new = dict(seg)
+                seg_new["start_time_full"] = m["start_time"]
+                seg_new["end_time_full"] = m["end_time"]
+            else:
+                seg_new = dict(seg)
+                seg_new["start_time_full"] = -1
+                seg_new["end_time_full"] = -1
+            new_segments.append(seg_new)
+            continue
+
+        # --- multiple overlaps → split into longest continuous chunks ---
+        cut_points = sorted({s} | {m["end_idx"] for m in overlapped if s < m["end_idx"] < e} | {e})
+        # Merge consecutive cuts if within small range (avoid over-splitting)
+        merged_cuts = [cut_points[0]]
+        for cp in cut_points[1:]:
+            if cp - merged_cuts[-1] > 5:  # keep chunks >=5 chars apart
+                merged_cuts.append(cp)
+        if merged_cuts[-1] != e:
+            merged_cuts.append(e)
+
+        for i in range(len(merged_cuts) - 1):
+            sub_start = merged_cuts[i]
+            sub_end = merged_cuts[i + 1]
+            sub_text = full_text[sub_start:sub_end].strip()
+            if not sub_text:
+                continue
+
+            # find full mapping whose range covers sub_start
+            sub_map = None
+            for m in overlapped:
+                if m["start_idx"] <= sub_start < m["end_idx"]:
+                    sub_map = m
+                    break
+            if not sub_map:
+                sub_map = overlapped[0]
+
+            ns = dict(seg)
+            ns["text"] = sub_text
+            ns["start_pos"] = sub_start
+            ns["end_pos"] = sub_end
+            ns["start_time_full"] = sub_map.get("start_time", -1)
+            ns["end_time_full"] = sub_map.get("end_time", -1)
+            new_segments.append(ns)
+
+    return new_segments
+
+
+full_text, time_map = combine_channel_text_with_map(full_channel)
+
+left_channel_4  = attach_full_times_and_longest_split(full_text, time_map, left_channel_3)
+right_channel_4 = attach_full_times_and_longest_split(full_text, time_map, right_channel_3)
