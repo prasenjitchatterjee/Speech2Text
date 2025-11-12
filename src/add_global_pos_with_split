@@ -1,0 +1,100 @@
+from typing import List, Dict, Any
+import unicodedata
+
+def add_global_pos_index_with_split(full_channel: List[Dict[str, Any]],
+                                    channel_segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Enhanced version:
+      - Splits a single channel segment into multiple parts if its text overlaps multiple
+        full_channel segments (each with its own start_time_full/end_time_full).
+      - Each split keeps channel's own start_time/end_time but uses full_channel timing for the global view.
+      - Works across languages and punctuation variants.
+    """
+
+    def strip_diacritics(text: str) -> str:
+        return ''.join(ch for ch in unicodedata.normalize('NFD', text)
+                       if unicodedata.category(ch) != 'Mn')
+
+    def normalize_text(text: str) -> str:
+        """Normalize text for language-agnostic fuzzy matching."""
+        text = strip_diacritics(text)
+        return ''.join(ch for ch in text if ch.isalnum()).casefold()
+
+    def fuzzy_overlap(a: str, b: str) -> bool:
+        """Check if two texts overlap significantly (normalized containment)."""
+        na, nb = normalize_text(a), normalize_text(b)
+        return na in nb or nb in na
+
+    out: List[Dict[str, Any]] = []
+
+    for seg in channel_segments:
+        seg_text = seg.get("text", "") or ""
+        if not seg_text.strip():
+            # Empty text — just propagate with placeholders
+            out.append({**seg,
+                        "start_pos": -1, "end_pos": -1,
+                        "start_time_full": -1, "end_time_full": -1})
+            continue
+
+        remaining_text = seg_text.strip()
+        seg_start_time = seg.get("start_time", -1)
+        seg_end_time = seg.get("end_time", -1)
+        matched_parts: List[Dict[str, Any]] = []
+
+        for fc in full_channel:
+            fc_text = fc.get("text", "") or ""
+            if not fc_text.strip():
+                continue
+
+            # Detect overlap ignoring punctuation/case/diacritics
+            if fuzzy_overlap(remaining_text, fc_text):
+                # Determine split size (approximate proportional cut)
+                fc_len = len(fc_text)
+                rem_len = len(remaining_text)
+                part_len = min(fc_len, rem_len)
+                part_text = remaining_text[:part_len].strip()
+
+                matched_parts.append({
+                    **seg,
+                    "text": part_text,
+                    "start_pos": 0,
+                    "end_pos": len(part_text),
+                    "start_time": seg_start_time,
+                    "end_time": seg_end_time,
+                    "start_time_full": fc.get("start_time", -1),
+                    "end_time_full": fc.get("end_time", -1),
+                })
+
+                # Trim used portion
+                remaining_text = remaining_text[part_len:].strip()
+                if not remaining_text:
+                    break
+
+        # Unmatched residue (text not found in any full chunk)
+        if remaining_text:
+            matched_parts.append({
+                **seg,
+                "text": remaining_text,
+                "start_pos": -1,
+                "end_pos": -1,
+                "start_time": seg_start_time,
+                "end_time": seg_end_time,
+                "start_time_full": -1,
+                "end_time_full": -1,
+            })
+
+        # If nothing matched at all, keep as-is
+        if not matched_parts:
+            matched_parts.append({
+                **seg,
+                "start_pos": -1,
+                "end_pos": -1,
+                "start_time": seg_start_time,
+                "end_time": seg_end_time,
+                "start_time_full": -1,
+                "end_time_full": -1,
+            })
+
+        out.extend(matched_parts)
+
+    return out
