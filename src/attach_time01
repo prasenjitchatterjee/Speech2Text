@@ -1,0 +1,91 @@
+from typing import List, Dict, Any
+
+def attach_full_times_and_split_segments(
+    full_text: str,
+    mapping: List[Dict[str, Any]],
+    expanded_segments: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """
+    Splits a segment into multiple parts if its [start_pos, end_pos) overlaps multiple
+    full_channel segments (e.g., interleaved speaker turns).
+    
+    Rules:
+    - NEVER add text from full_text that wasn't in the original segment.
+    - Each subsegment inherits channel, start_time, end_time from parent.
+    - start_time_full / end_time_full come from the full_channel segment it overlaps.
+    - start_pos / end_pos are adjusted to the sub-span in the full text.
+    - Text slicing is always done within the original segment text bounds only.
+
+    Supports all languages — multilingual safe.
+    """
+
+    def overlaps(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
+        return not (a_end <= b_start or a_start >= b_end)
+
+    new_segments: List[Dict[str, Any]] = []
+
+    for seg in expanded_segments:
+        s = seg.get("start_pos", -1)
+        e = seg.get("end_pos", -1)
+        text = seg.get("text", "") or ""
+
+        # Default: if invalid positions or no mapping overlap
+        if not isinstance(s, int) or not isinstance(e, int) or s == -1 or e == -1 or e <= s:
+            ns = dict(seg)
+            ns["start_time_full"] = -1
+            ns["end_time_full"] = -1
+            new_segments.append(ns)
+            continue
+
+        # Find full segments that overlap this one
+        overlapping = [m for m in mapping if overlaps(s, e, m["start_idx"], m["end_idx"])]
+
+        # If no overlaps, assign -1 times
+        if not overlapping:
+            ns = dict(seg)
+            ns["start_time_full"] = -1
+            ns["end_time_full"] = -1
+            new_segments.append(ns)
+            continue
+
+        # If only one overlap → no split needed
+        if len(overlapping) == 1:
+            m = overlapping[0]
+            ns = dict(seg)
+            ns["start_time_full"] = m.get("start_time", -1)
+            ns["end_time_full"] = m.get("end_time", -1)
+            new_segments.append(ns)
+            continue
+
+        # Otherwise, split into subsegments at mapping boundaries (but only within original segment range)
+        cut_points = [s]
+        for m in overlapping:
+            if s < m["end_idx"] < e:
+                cut_points.append(m["end_idx"])
+        cut_points.append(e)
+        cut_points = sorted(set(cut_points))
+
+        for i in range(len(cut_points) - 1):
+            a, b = cut_points[i], cut_points[i + 1]
+            if b <= a:
+                continue
+
+            # Determine which full mapping covers this span
+            m_for_span = None
+            for m in overlapping:
+                if overlaps(a, b, m["start_idx"], m["end_idx"]):
+                    m_for_span = m
+                    break
+
+            sub_text = text  # <-- keep the agent/customer’s own text intact
+
+            ns = dict(seg)
+            ns["start_pos"] = a
+            ns["end_pos"] = b
+            ns["text"] = sub_text.strip()
+            ns["start_time_full"] = m_for_span.get("start_time", -1) if m_for_span else -1
+            ns["end_time_full"] = m_for_span.get("end_time", -1) if m_for_span else -1
+
+            new_segments.append(ns)
+
+    return new_segments
