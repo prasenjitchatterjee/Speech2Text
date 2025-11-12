@@ -1,0 +1,120 @@
+import unicodedata
+from typing import List, Dict, Any
+
+def attach_full_times_with_smart_split(expanded_segments: List[Dict[str, Any]], mapping: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Multilingual-safe version of attach_full_times:
+      - Handles English, Hindi, Arabic, and CJK languages correctly.
+      - Splits channel segments intelligently when they span multiple full_channel entries.
+      - Uses space-based splitting for word-spaced languages.
+      - Uses character-based proportional splitting for CJK (no-space) scripts.
+      - Always preserves text (never truncates or loses words/characters).
+      - Assigns start_time_full and end_time_full from the full_channel mapping.
+
+    Returns a new list of segments (some split into multiple subsegments).
+    """
+
+    def is_cjk(ch: str) -> bool:
+        """Detect if a character belongs to a CJK block."""
+        return any([
+            '\u4e00' <= ch <= '\u9fff',   # CJK Unified Ideographs
+            '\u3040' <= ch <= '\u309f',   # Hiragana
+            '\u30a0' <= ch <= '\u30ff',   # Katakana
+            '\uac00' <= ch <= '\ud7af'    # Hangul
+        ])
+
+    def is_space_based_language(text: str) -> bool:
+        """Rough heuristic: treat as CJK if ≥30% CJK chars or no spaces."""
+        if not text.strip():
+            return True
+        cjk_ratio = sum(is_cjk(ch) for ch in text) / max(1, len(text))
+        return not (cjk_ratio > 0.3 and " " not in text)
+
+    def find_mapping_range(start_pos, end_pos):
+        """Return mapping entries overlapped by [start_pos, end_pos)."""
+        return [m for m in mapping if not (end_pos <= m["start_idx"] or start_pos >= m["end_idx"])]
+
+    def split_on_word_boundary(text, split_index):
+        """Split string safely on nearest space (for space-based languages)."""
+        if split_index <= 0 or split_index >= len(text):
+            return text, ""
+        left_space = text.rfind(" ", 0, split_index)
+        right_space = text.find(" ", split_index)
+        # Choose closer space boundary
+        if left_space != -1 and (split_index - left_space) <= (right_space - split_index if right_space != -1 else len(text)):
+            split_index = left_space
+        elif right_space != -1:
+            split_index = right_space
+        return text[:split_index].strip(), text[split_index:].strip()
+
+    new_segments = []
+
+    for seg in expanded_segments:
+        start_pos = seg.get("start_pos", -1)
+        end_pos = seg.get("end_pos", -1)
+        seg_text = seg.get("text", "") or ""
+
+        if not isinstance(start_pos, int) or not isinstance(end_pos, int) or start_pos == -1 or end_pos == -1:
+            seg["start_time_full"] = -1
+            seg["end_time_full"] = -1
+            new_segments.append(seg)
+            continue
+
+        overlapped = find_mapping_range(start_pos, end_pos)
+
+        # No overlap → keep unchanged
+        if not overlapped:
+            seg["start_time_full"] = -1
+            seg["end_time_full"] = -1
+            new_segments.append(seg)
+            continue
+
+        # Single overlap → direct assign
+        if len(overlapped) == 1:
+            m = overlapped[0]
+            seg["start_time_full"] = m["start_time"]
+            seg["end_time_full"] = m["end_time"]
+            new_segments.append(seg)
+            continue
+
+        # --- Multi-mapping overlap → need to split text ---
+        space_based = is_space_based_language(seg_text)
+        total_len = len(seg_text)
+        remaining_text = seg_text
+
+        for idx, m in enumerate(overlapped):
+            m_start, m_end = m["start_idx"], m["end_idx"]
+            # Proportion of overlap
+            overlap_ratio = (min(end_pos, m_end) - max(start_pos, m_start)) / max(1, (end_pos - start_pos))
+            est_chars = max(1, int(overlap_ratio * total_len))
+
+            if space_based:
+                part_text, remaining_text = split_on_word_boundary(remaining_text, est_chars)
+            else:
+                # CJK: split by character count (no spaces)
+                part_text = remaining_text[:est_chars]
+                remaining_text = remaining_text[est_chars:]
+
+            part_seg = dict(seg)
+            part_seg["text"] = part_text.strip()
+            part_seg["start_time_full"] = m["start_time"]
+            part_seg["end_time_full"] = m["end_time"]
+            part_seg["start_pos"] = m_start
+            part_seg["end_pos"] = m_end
+
+            new_segments.append(part_seg)
+            if not remaining_text:
+                break
+
+        # If leftover text → append to last fragment
+        if remaining_text and new_segments:
+            new_segments[-1]["text"] = (new_segments[-1]["text"] + " " + remaining_text).strip()
+
+    return new_segments
+
+
+# After expand_missing_segments
+full_text, time_map = combine_channel_text_with_map(full_channel)
+
+left_channel_4 = attach_full_times_with_smart_split(left_channel_3, time_map)
+right_channel_4 = attach_full_times_with_smart_split(right_channel_3, time_map)
