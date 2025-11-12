@@ -1,0 +1,224 @@
+from typing import List, Dict, Any, Optional
+import unicodedata
+
+# ---------- Normalization helpers (multilingual-safe) ----------
+
+def strip_diacritics(text: str) -> str:
+    """Remove combining diacritics from any Unicode string."""
+    return ''.join(
+        ch for ch in unicodedata.normalize('NFD', text)
+        if unicodedata.category(ch) != 'Mn'
+    )
+
+def _normalize_char_emit(ch: str) -> str:
+    """
+    Normalize a single character:
+    - Decompose + strip diacritics
+    - Keep alphanumeric only
+    - Casefold
+    """
+    base = ''.join(c for c in unicodedata.normalize('NFD', ch) if unicodedata.category(c) != 'Mn')
+    out = []
+    for c in base:
+        if c.isalnum():
+            out.append(c.casefold())
+    return ''.join(out)
+
+def build_normalized_index(full_text: str):
+    """
+    Build a normalized string ignoring punctuation, spaces, diacritics, case,
+    and return mappings between normalized and original indices.
+    """
+    norm_chars, norm_to_orig = [], []
+    orig_to_first_norm = [None] * (len(full_text) + 1)
+
+    for i, ch in enumerate(full_text):
+        emit = _normalize_char_emit(ch)
+        if emit:
+            start_norm_idx = len(norm_chars)
+            norm_chars.extend(list(emit))
+            norm_to_orig.extend([i] * len(emit))
+            if orig_to_first_norm[i] is None:
+                orig_to_first_norm[i] = start_norm_idx
+
+    orig_to_first_norm[-1] = len(norm_chars)
+    next_idx = orig_to_first_norm[-1]
+    for k in range(len(full_text), -1, -1):
+        if orig_to_first_norm[k] is None:
+            orig_to_first_norm[k] = next_idx
+        else:
+            next_idx = orig_to_first_norm[k]
+
+    return ''.join(norm_chars), norm_to_orig, orig_to_first_norm
+
+
+def map_norm_match_to_orig_bounds(full_text: str,
+                                  norm_to_orig: List[int],
+                                  n_start: int,
+                                  n_len: int) -> (int, int):
+    """Map normalized substring indices back to original [start, end) positions."""
+    if n_len <= 0:
+        return -1, -1
+    n_end_inclusive = n_start + n_len - 1
+    if n_start < 0 or n_end_inclusive >= len(norm_to_orig):
+        return -1, -1
+
+    orig_start = norm_to_orig[n_start]
+    last_base_idx = norm_to_orig[n_end_inclusive]
+
+    # include any trailing combining marks
+    end_exclusive = last_base_idx + 1
+    while end_exclusive < len(full_text) and unicodedata.category(full_text[end_exclusive]) == 'Mn':
+        end_exclusive += 1
+
+    return orig_start, end_exclusive
+
+
+def normalize_text(text: str) -> str:
+    """Full normalization for search matching."""
+    text = strip_diacritics(text)
+    text = ''.join(ch for ch in text if ch.isalnum())
+    return text.casefold()
+
+
+def combine_channel_text(full_channel: List[Dict[str, Any]]) -> str:
+    """Join all text fields from full channel safely."""
+    return " ".join(item.get("text", "") for item in full_channel if isinstance(item, dict)).strip()
+
+
+# ---------- Final expand_missing_segments ----------
+
+def expand_missing_segments(
+    full_channel: List[Dict[str, Any]],
+    segments: List[Dict[str, Any]],
+    min_words: int = 2,
+) -> List[Dict[str, Any]]:
+    """
+    Replace any segment with start_pos == -1 by fragments found in full_text,
+    using approximate normalized matching (case/space/punct/diacritics-insensitive).
+
+    - Never drops text; unmatched words are retained and stitched back.
+    - Handles multilingual content robustly.
+    - Consecutive fragments from the same utterance are merged before returning.
+    """
+    full_text = combine_channel_text(full_channel)
+    norm_full, norm_to_orig, orig_to_next_norm = build_normalized_index(full_text)
+
+    channel_hint = next((s.get("channel") for s in segments if isinstance(s.get("channel"), str) and s["channel"]), None)
+
+    def next_known_start_from_input(idx: int) -> Optional[int]:
+        for k in range(idx + 1, len(segments)):
+            st = segments[k].get("start_pos", -1)
+            if isinstance(st, int) and st != -1:
+                return st
+        return None
+
+    def last_known_end_from_output(out: List[Dict[str, Any]]) -> int:
+        for k in range(len(out) - 1, -1, -1):
+            item = out[k]
+            if isinstance(item, dict) and isinstance(item.get("end_pos", None), int) and item["end_pos"] != -1:
+                return item["end_pos"]
+        return 0
+
+    def _clone_fragment(base: Dict[str, Any], *, text: str, start_idx: int, end_idx: int) -> Dict[str, Any]:
+        frag = dict(base)
+        frag["text"] = text
+        frag["start_pos"] = start_idx
+        frag["end_pos"] = end_idx
+        for k in ("start_time", "end_time", "start_time_full", "end_time_full"):
+            if k not in frag or frag[k] is None:
+                frag[k] = -1
+        if ("channel" not in frag or not frag["channel"]) and channel_hint:
+            frag["channel"] = channel_hint
+        return frag
+
+    def find_in_window(candidate: str, window_start_orig: int, window_end_orig: Optional[int]) -> (int, int):
+        cand_norm = normalize_text(candidate)
+        if not cand_norm:
+            return -1, -1
+
+        n_start = orig_to_next_norm[min(max(0, window_start_orig), len(full_text))]
+        n_end = len(norm_full) if window_end_orig is None else orig_to_next_norm[min(max(0, window_end_orig), len(full_text))]
+        if n_start is None or n_start >= n_end:
+            return -1, -1
+
+        rel = norm_full.find(cand_norm, n_start, n_end)
+        if rel == -1:
+            return -1, -1
+
+        start_pos, end_pos = map_norm_match_to_orig_bounds(full_text, norm_to_orig, rel, len(cand_norm))
+        return start_pos, end_pos
+
+    def match_fragments_in_window(base_seg: Dict[str, Any], text: str, window_start: int, window_end: Optional[int]) -> List[Dict[str, Any]]:
+        words = text.split()
+        i = 0
+        frags: List[Dict[str, Any]] = []
+        search_pos = window_start
+        unmatched_parts: List[str] = []
+
+        while i < len(words):
+            found_any = False
+            for j in range(len(words), i + min_words - 1, -1):
+                candidate = " ".join(words[i:j])
+                s_pos, e_pos = find_in_window(candidate, search_pos, window_end)
+                if s_pos != -1:
+                    # Add any unmatched part accumulated before
+                    if unmatched_parts:
+                        unmatched_text = " ".join(unmatched_parts).strip()
+                        frags.append(_clone_fragment(base_seg, text=unmatched_text, start_idx=-1, end_idx=-1))
+                        unmatched_parts = []
+                    # Add the matched candidate
+                    frags.append(_clone_fragment(base_seg, text=candidate, start_idx=s_pos, end_idx=e_pos))
+                    search_pos = e_pos
+                    i = j
+                    found_any = True
+                    break
+            if not found_any:
+                unmatched_parts.append(words[i])
+                i += 1
+
+        # If something remains unmatched at the end
+        if unmatched_parts:
+            unmatched_text = " ".join(unmatched_parts).strip()
+            frags.append(_clone_fragment(base_seg, text=unmatched_text, start_idx=-1, end_idx=-1))
+
+        return frags
+
+    # --- Main loop ---
+    output: List[Dict[str, Any]] = []
+    for i, seg in enumerate(segments):
+        if ("channel" not in seg or not seg.get("channel")) and channel_hint:
+            seg = {**seg, "channel": channel_hint}
+        for k in ("start_time", "end_time", "start_time_full", "end_time_full"):
+            if k not in seg or seg[k] is None:
+                seg[k] = -1
+
+        st = seg.get("start_pos", -1)
+        if isinstance(st, int) and st != -1:
+            output.append(seg)
+            continue
+
+        prev_end = last_known_end_from_output(output)
+        next_start = next_known_start_from_input(i)
+        frags = match_fragments_in_window(seg, seg.get("text", "") or "", prev_end, next_start)
+
+        if frags:
+            output.extend(frags)
+        else:
+            output.append(seg)
+
+    # --- Merge consecutive fragments from same utterance (same channel & times) ---
+    merged_output: List[Dict[str, Any]] = []
+    for frag in output:
+        if (
+            merged_output
+            and frag.get("channel") == merged_output[-1].get("channel")
+            and frag.get("start_time") == merged_output[-1].get("start_time")
+            and frag.get("end_time") == merged_output[-1].get("end_time")
+        ):
+            merged_output[-1]["text"] = (merged_output[-1]["text"].rstrip() + " " + frag["text"].lstrip()).strip()
+            merged_output[-1]["end_pos"] = max(merged_output[-1]["end_pos"], frag["end_pos"])
+        else:
+            merged_output.append(frag)
+
+    return merged_output
