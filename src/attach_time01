@@ -1,172 +1,49 @@
 from typing import List, Dict, Any
 
-def attach_full_times_and_split_segments(
+def attach_full_times_no_split(
     full_text: str,
     mapping: List[Dict[str, Any]],
-    expanded_segments: List[Dict[str, Any]]
+    segments: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
     """
-    Split a segment ONLY if its [start_pos, end_pos) crosses multiple full_channel segments.
-    - Text for each fragment is sliced from the ORIGINAL segment's text, never from full_text.
-    - Fragment [start_pos, end_pos) are the subspans in the combined full_text.
-    - Fragment start_time_full/end_time_full come from the overlapped full_channel mapping.
-    - start_time/end_time (channel-native) are preserved across fragments.
-    - Space-separated languages: snap text splits to nearest space; CJK: raw char split.
+    Assign start_time_full / end_time_full to each segment strictly by its own [start_pos, end_pos)
+    against the full transcript mapping. No splitting, no text changes, no channel spillover.
 
-    Returns a NEW list of segments; inputs are not mutated.
+    mapping: list of dicts with keys: start_idx, end_idx, start_time, end_time
+    segments: list of dicts with keys incl. start_pos, end_pos (others preserved)
     """
 
-    def is_cjk(ch: str) -> bool:
-        return (
-            '\u4e00' <= ch <= '\u9fff' or  # CJK Unified
-            '\u3040' <= ch <= '\u309f' or  # Hiragana
-            '\u30a0' <= ch <= '\u30ff' or  # Katakana
-            '\uac00' <= ch <= '\ud7af'     # Hangul
-        )
-
-    def space_based_language(s: str) -> bool:
-        if not s:
-            return True
-        cjk_cnt = sum(1 for ch in s if is_cjk(ch))
-        return not (cjk_cnt / max(1, len(s)) > 0.3 and ' ' not in s)
-
     def overlaps(a0: int, a1: int, b0: int, b1: int) -> bool:
+        # half-open intervals [a0,a1) and [b0,b1)
         return not (a1 <= b0 or a0 >= b1)
-
-    def pick_full_row(a: int, b: int) -> Dict[str, Any]:
-        # find first mapping row that overlaps [a,b)
-        for m in mapping:
-            if overlaps(a, b, m["start_idx"], m["end_idx"]):
-                return m
-        return {"start_time": -1, "end_time": -1}
-
-    def build_cut_points(s: int, e: int) -> List[int]:
-        # boundaries at each full segment end that lies strictly inside [s,e)
-        cuts = [s]
-        for m in mapping:
-            me = m["end_idx"]
-            if s < me < e:
-                cuts.append(me)
-        cuts.append(e)
-        cuts = sorted(set(cuts))
-        return cuts
 
     out: List[Dict[str, Any]] = []
 
-    for seg in expanded_segments:
+    for seg in segments:
         s = seg.get("start_pos", -1)
         e = seg.get("end_pos", -1)
-        seg_text = seg.get("text", "") or ""
 
-        # invalid positions → just attach -1 full times, no splitting
-        if not (isinstance(s, int) and isinstance(e, int) and s != -1 and e != -1 and e > s):
-            ns = dict(seg)
-            ns["start_time_full"] = -1
-            ns["end_time_full"] = -1
-            out.append(ns)
-            continue
+        start_time_full = -1
+        end_time_full   = -1
 
-        # get which full rows overlap; if only one → no split, just assign times
-        overlapped_rows = [m for m in mapping if overlaps(s, e, m["start_idx"], m["end_idx"])]
-        if not overlapped_rows:
-            ns = dict(seg)
-            ns["start_time_full"] = -1
-            ns["end_time_full"] = -1
-            out.append(ns)
-            continue
+        if (
+            isinstance(s, int) and isinstance(e, int) and
+            s != -1 and e != -1 and e > s
+        ):
+            # gather overlapped full rows in order
+            ov = [m for m in mapping if overlaps(s, e, m["start_idx"], m["end_idx"])]
 
-        if len(overlapped_rows) == 1:
-            m = overlapped_rows[0]
-            ns = dict(seg)
-            ns["start_time_full"] = m.get("start_time", -1) if m.get("start_time") is not None else -1
-            ns["end_time_full"]   = m.get("end_time", -1)   if m.get("end_time")   is not None else -1
-            out.append(ns)
-            continue
+            if ov:
+                first = ov[0]
+                last  = ov[-1]
+                st = first.get("start_time", None)
+                et = last.get("end_time", None)
+                start_time_full = st if isinstance(st, (int, float)) else -1
+                end_time_full   = et if isinstance(et, (int, float)) else -1
 
-        # --- Multiple full rows overlapped: split this segment ---
-        # Cut in full-text coordinate space
-        cuts_full = build_cut_points(s, e)
-
-        # Map full-text subspans proportionally onto the segment's own text range [0, L)
-        L = len(seg_text)
-        if L == 0:
-            # Degenerate, but keep structure
-            ns = dict(seg)
-            ns["start_time_full"] = overlapped_rows[0].get("start_time", -1)
-            ns["end_time_full"]   = overlapped_rows[-1].get("end_time", -1)
-            out.append(ns)
-            continue
-
-        space_based = space_based_language(seg_text)
-
-        # helper to snap a relative text index to nearest space boundary
-        def snap_rel_idx(idx_rel: int, lower_bound: int, upper_bound: int) -> int:
-            idx_rel = max(lower_bound, min(upper_bound, idx_rel))
-            if not space_based:
-                return idx_rel
-            if idx_rel in (lower_bound, upper_bound):
-                return idx_rel
-            # nearest space to the right, then left
-            right = seg_text.find(' ', idx_rel, upper_bound)
-            left  = seg_text.rfind(' ', lower_bound, idx_rel)
-            dist_r = None if right == -1 else (right - idx_rel)
-            dist_l = None if left  == -1 else (idx_rel - left)
-            if dist_r is None and dist_l is None:
-                return idx_rel
-            if dist_r is None:  return left
-            if dist_l is None:  return right
-            # prefer right if equal
-            return right if dist_r <= dist_l else left
-
-        # walk subspans; maintain a monotonic rel cursor to avoid duplicates/gaps
-        rel_cursor = 0
-        for i in range(len(cuts_full) - 1):
-            a_full = cuts_full[i]
-            b_full = cuts_full[i + 1]
-            if b_full <= a_full:
-                continue
-
-            # proportional mapping from [s,e) -> [0,L)
-            # for the end boundary we use ceil to reduce truncation; last fragment forced to L
-            rel_start = rel_cursor
-            if i == len(cuts_full) - 2:
-                rel_end = L
-            else:
-                rel_end_float = (b_full - s) / (e - s) * L
-                rel_end = int(round(rel_end_float))
-
-            # snap to word boundaries for space-based languages
-            rel_start = snap_rel_idx(rel_start, 0, L)
-            rel_end   = snap_rel_idx(rel_end,   rel_start + 1, L)  # ensure at least 1 char if possible
-
-            if rel_end <= rel_start:
-                continue  # skip empty fragments
-
-            sub_text = seg_text[rel_start:rel_end].strip()
-            if not sub_text:
-                rel_cursor = rel_end
-                continue
-
-            # assign full times for this subspan from the overlapped full row
-            m_row = pick_full_row(a_full, b_full)
-
-            ns = dict(seg)
-            ns["text"] = sub_text
-            ns["start_pos"] = a_full
-            ns["end_pos"] = b_full
-            ns["start_time_full"] = m_row.get("start_time", -1) if m_row.get("start_time") is not None else -1
-            ns["end_time_full"]   = m_row.get("end_time", -1)   if m_row.get("end_time")   is not None else -1
-            # keep channel-native times from parent
-            ns["start_time"] = seg.get("start_time", -1)
-            ns["end_time"]   = seg.get("end_time", -1)
-
-            out.append(ns)
-            rel_cursor = rel_end
+        new_seg = dict(seg)
+        new_seg["start_time_full"] = start_time_full
+        new_seg["end_time_full"]   = end_time_full
+        out.append(new_seg)
 
     return out
-
-
-full_text, time_map = combine_channel_text_with_map(full_channel)
-
-left_channel_4  = attach_full_times_and_split_segments(full_text, time_map, left_channel_3)
-right_channel_4 = attach_full_times_and_split_segments(full_text, time_map, right_channel_3)
