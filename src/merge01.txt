@@ -1,0 +1,62 @@
+def match_fragments_in_window(base_seg: Dict[str, Any], text: str, window_start: int, window_end: Optional[int]) -> List[Dict[str, Any]]:
+    """
+    Find subsequence matches of `text` in the full_text window without losing or reordering words.
+
+    Rules:
+      - Accumulate unmatched words in a buffer.
+      - On the first match: prepend any accumulated unmatched text to that match's text.
+      - Between matches: append accumulated unmatched text to the previous matched fragment.
+      - After the last match: append any remaining unmatched text to the last matched fragment.
+      - If no matches at all: return a single fragment with the full original text and -1 positions.
+    """
+    words = text.split()
+    i = 0
+    frags: List[Dict[str, Any]] = []
+    search_pos = window_start
+    pending_unmatched: List[str] = []
+
+    while i < len(words):
+        found_any = False
+        # longest -> shortest subsequence of words[i:]
+        for j in range(len(words), i + min_words - 1, -1):
+            candidate = " ".join(words[i:j])
+            s_pos, e_pos = find_in_window(candidate, search_pos, window_end)
+            if s_pos != -1:
+                # We have a match
+                cand_text = candidate
+
+                if not frags:
+                    # unmatched BEFORE first match -> PREPEND to first fragment
+                    if pending_unmatched:
+                        cand_text = (" ".join(pending_unmatched) + " " + cand_text).strip()
+                        pending_unmatched = []
+                    # create first fragment
+                    frags.append(_clone_fragment(base_seg, text=cand_text, start_idx=s_pos, end_idx=e_pos))
+                else:
+                    # unmatched BETWEEN matches -> APPEND to previous fragment
+                    if pending_unmatched:
+                        frags[-1]["text"] = (frags[-1]["text"].rstrip() + " " + " ".join(pending_unmatched)).strip()
+                        pending_unmatched = []
+                    # add the new matched fragment
+                    frags.append(_clone_fragment(base_seg, text=cand_text, start_idx=s_pos, end_idx=e_pos))
+
+                search_pos = e_pos  # advance in original text
+                i = j
+                found_any = True
+                break
+
+        if not found_any:
+            # no match at this token: accumulate and advance
+            pending_unmatched.append(words[i])
+            i += 1
+
+    # After loop: handle tail unmatched
+    if pending_unmatched:
+        if frags:
+            # APPEND to last matched fragment
+            frags[-1]["text"] = (frags[-1]["text"].rstrip() + " " + " ".join(pending_unmatched)).strip()
+        else:
+            # No matches at all: emit single fragment with full text and -1 positions
+            frags.append(_clone_fragment(base_seg, text=" ".join(pending_unmatched).strip(), start_idx=-1, end_idx=-1))
+
+    return frags
