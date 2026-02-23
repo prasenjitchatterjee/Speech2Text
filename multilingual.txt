@@ -1,0 +1,20 @@
+We want to clarify an observed behavior with the
+
+Users report that Whisper sometimes detects the wrong language and translates instead of transcribing, even when the model understood the content:
+https://community.openai.com/t/whisper-3-detects-incorrect-language-translates-instead-of-transcribes/828870
+
+A GitHub discussion highlights issues with multilingual audio where the output does not preserve separate languages unless the language is specified explicitly:
+https://github.com/openai/whisper/discussions/2009
+
+In a Hugging Face discussion, developers note that Whisper cannot reliably return mixed languages in a single file due to how training data was structured, which can lead to incorrect language labels or translations:
+https://github.com/openai/whisper/discussions/2391
+
+Summary:
+
+Whisper’s automatic language detection is not perfect for multilingual audio and may default to translation or output in a dominant language.
+
+The issue is known and discussed by the community and GitHub contributors.
+
+Explicitly specifying the language when calling the model can often improve transcription fidelity.
+
+We continue to monitor model updates and best practices around handling multilingual audio and will apply improvements as they become available.
