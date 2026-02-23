@@ -1,0 +1,35 @@
+We would like to provide a brief clarification regarding the intermittent issue where small portions of audio (sometimes at the beginning or mid-conversation) are not transcribed when using the Whisper Large v3 Turbo model.
+
+After detailed analysis and parameter tuning, we have confirmed that this is a known behavior reported by multiple users across OpenAI and Hugging Face platforms, and is not specific to our implementation.
+
+Below are documented references:
+
+1. Skipped Sentences / Random Missing Segments
+Users reporting Whisper randomly skipping sentences:
+https://community.openai.com/t/whisper-sometimes-randomly-skip-sentence/533502
+
+2. Missing Audio Sequences After Processing
+GitHub discussion highlighting missing portions (e.g., 15–20 seconds not transcribed):
+https://github.com/openai/whisper/discussions/1193
+
+3. Chunks of Speech Omitted in Longer Recordings
+Reports of Whisper leaving out sections in long-form transcription:
+https://community.openai.com/t/whisper-leaves-out-chunks-of-speech-in-longer-transcript/715999
+
+4. Hugging Face Discussion on Untranscribed Segments / Blank Outputs
+Community thread discussing missing or incomplete segments during chunked transcription:
+https://huggingface.co/openai/whisper-large/discussions/13
+
+These discussions indicate that:
+
+Whisper processes audio in ~30-second windows and relies on chunking/stitching for long recordings.
+
+Long-form decoding uses internal confidence thresholds and fallback mechanisms.
+
+In certain edge cases (boundary speech, silence, noise, abrupt transitions), valid speech segments may occasionally be skipped.
+
+We have optimized chunk size, stride overlap, and GPU batch handling to significantly reduce occurrence. However, due to the underlying model design, rare edge cases cannot be fully eliminated.
+
+We continue to monitor updates from OpenAI and Hugging Face and will incorporate improvements as they become available.
+
+Please let us know if you would like a technical walkthrough of the mitigation measures in place.
