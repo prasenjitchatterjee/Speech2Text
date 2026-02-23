@@ -1,0 +1,74 @@
+We would like to provide a clear explanation regarding the intermittent issue where small portions of audio (occasionally at the beginning or mid-conversation) are not transcribed when using the Whisper Large v3 Turbo model.
+
+After thorough investigation, tuning of parameters (including chunk size and stride overlap), and validation across multiple datasets, we confirmed that this behavior is a known limitation of the Whisper architecture and its long-form transcription mechanism, and is not specific to our implementation.
+
+Below is a concise explanation with references from official and community sources.
+
+1. Architectural Limitation – 30-Second Processing Window
+
+Whisper models are designed to process audio in ~30-second windows. Any audio longer than this must be handled using chunking or sequential long-form transcription logic.
+
+This is explicitly documented in the Hugging Face model documentation for Whisper:
+https://huggingface.co/openai/whisper-large-v3
+
+Because longer audio must be split and reassembled, there is an inherent dependency on window stitching logic.
+
+2. Long-Form Transcription Uses Heuristics That Can Drop Segments
+
+For long audio, the model relies on timestamp prediction and internal heuristics such as:
+
+Log probability thresholds
+
+Compression ratio checks
+
+Temperature fallback
+
+These mechanisms are meant to prevent hallucinations and low-confidence outputs, but in some edge cases (noise, silence, overlapping speech, boundary cuts), they may suppress valid speech segments.
+
+This behavior is documented in the Hugging Face Whisper implementation details:
+https://huggingface.co/docs/transformers/en/model_doc/whisper
+
+3. Known Segmentation & Boundary Issues in Community Discussions
+
+Several users have reported skipped or partially transcribed segments when using chunking or long-form processing:
+
+Hugging Face discussion on Whisper Large v3 Turbo:
+https://huggingface.co/openai/whisper-large-v3-turbo/discussions
+
+OpenAI Whisper GitHub discussions highlighting long-form edge cases:
+https://github.com/openai/whisper/discussions
+
+Community discussion describing skipped chunks during transcription:
+https://community.openai.com/t/whisper-asr-model-skipping-chunks-in-audio-transcription/1067744
+
+These reports confirm that the issue is observed across environments and deployments.
+
+4. Why Parameter Tuning Helps but Cannot Guarantee 100%
+
+We adjusted:
+
+chunk_length_s
+
+stride_length_s (overlap)
+
+GPU batch processing
+
+These measures significantly reduce the likelihood of missing segments. However, due to the underlying window-based architecture and heuristic filtering, there is no deterministic guarantee that 100% of edge-case boundary speech will always be captured.
+
+This is a known trade-off between:
+
+Avoiding hallucinated or duplicated text
+
+Maintaining stability in long-form transcription
+
+Managing performance at scale
+
+5. Current Status
+
+The model performs reliably in the vast majority of cases.
+
+The issue appears intermittently under specific acoustic conditions (e.g., boundary speech, low SNR, abrupt starts, long silences).
+
+It is consistent with known behavior documented by OpenAI and Hugging Face communities.
+
+We continue to monitor updates from the Whisper and Transformers maintainers and will evaluate improvements as they are released.
